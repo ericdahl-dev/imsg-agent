@@ -170,10 +170,23 @@ def test_prefers_text_column_then_falls_back_to_blob(db):
     assert "first from them" in msgs
 
 
-def test_newest_first_and_direction(db):
+def test_newest_first(db):
     msgs = read_thread("+15555550123", db_path=db)
     assert msgs[0].has_attachment is True          # rowid 3 is newest surviving
-    assert any(m.from_me for m in msgs)
+
+
+def test_returns_both_sides_of_the_conversation(db):
+    """Both directions must come back. Reading only the other side loses what
+    you already said -- and therefore what is still unanswered."""
+    msgs = read_thread("+15555550123", db_path=db)
+    assert any(m.from_me for m in msgs), "lost the sent side"
+    assert any(not m.from_me for m in msgs), "lost the received side"
+
+
+def test_direction_is_not_inverted(db):
+    """rowid 2 is the only is_from_me=1 row in the fixture."""
+    sent = [m for m in read_thread("+15555550123", db_path=db) if m.from_me]
+    assert [m.text for m in sent] == ["plain text column wins"]
 
 
 def test_include_empty_keeps_bodyless_rows(db):
