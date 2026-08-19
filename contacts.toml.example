@@ -1,0 +1,8 @@
+# Copy to contacts.toml and fill in. contacts.toml is gitignored -- real
+# identifiers never get committed.
+#
+# Named contacts keep phone numbers out of shell history, CI logs, and agent
+# transcripts. Callers pass `--contact disco` instead of the raw number.
+
+[contacts]
+disco = "+15555550123"
