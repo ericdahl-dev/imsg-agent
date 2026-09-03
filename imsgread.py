@@ -1,4 +1,4 @@
-"""Read a single iMessage thread from chat.db, decoded and scoped.
+"""Read one iMessage thread from chat.db, and send to one, decoded and scoped.
 
 Two things make this worth being code instead of instructions in an AGENTS.md:
 
@@ -12,7 +12,9 @@ Two things make this worth being code instead of instructions in an AGENTS.md:
    "all messages" -- every read path requires a chat identifier. A rule written
    in prose depends on the reader choosing to follow it; this one does not.
 
-Read-only throughout. The database is opened with `mode=ro` and never written.
+The database is opened with `mode=ro` and never written. Sending goes through
+AppleScript, never through chat.db, and is scoped the same way reads are: one
+identifier, no broadcast path.
 """
 
 from __future__ import annotations
@@ -21,9 +23,11 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, asdict
+from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -208,6 +212,63 @@ def read_thread(
 # cli
 # --------------------------------------------------------------------------
 
+AGENT_MARKER = "\U0001F916"  # robot face
+
+
+def mark_agent_sent(text: str, *, robot: bool) -> str:
+    """Append the agent marker so a recipient can tell who actually wrote this.
+
+    Provenance, not decoration: a person reading the thread months later should
+    be able to see which messages a human typed. Appended rather than prefixed
+    so the message still opens with its own first line.
+    """
+    if not robot:
+        return text
+    if text.rstrip().endswith(AGENT_MARKER):
+        return text
+    return f"{text.rstrip()} {AGENT_MARKER}"
+
+
+SEND_SCRIPT = """on run argv
+set t to (read (POSIX file (item 1 of argv)) as \u00abclass utf8\u00bb)
+tell application "Messages" to send t to participant (item 2 of argv) of (first account whose service type is iMessage)
+end run"""
+
+
+def send_message(chat: str | None, text: str, *, robot: bool) -> None:
+    """Send one iMessage to one chat identifier.
+
+    Scoped the same way reads are: no identifier, no send. There is no
+    broadcast path and no "reply to whoever was last" convenience.
+
+    The body goes via a UTF-8 file rather than inline in the AppleScript.
+    Inline quoting mangles apostrophes and emoji, and the agent marker is an
+    emoji, so this is not optional.
+    """
+    identifier = (chat or "").strip()
+    if not identifier:
+        raise ScopeError("a chat identifier is required to send")
+
+    body = mark_agent_sent(text, robot=robot)
+    if not body.strip():
+        raise ValueError("refusing to send an empty message")
+
+    with NamedTemporaryFile("w", suffix=".txt", encoding="utf-8", delete=False) as handle:
+        handle.write(body)
+        body_path = handle.name
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", SEND_SCRIPT, body_path, identifier],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
+    finally:
+        os.unlink(body_path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="imsg-read",
@@ -223,8 +284,65 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-empty", action="store_true", help="keep rows with no body")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to chat.db")
     p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
+    p.add_argument("--send", action="store_true", help="send a message instead of reading")
+    body = p.add_mutually_exclusive_group()
+    body.add_argument("--message", help="message body (prefer --message-file for anything with quotes or emoji)")
+    body.add_argument("--message-file", type=Path, help="file containing the message body, read as UTF-8")
+    marker = p.add_mutually_exclusive_group()
+    marker.add_argument("--robot", dest="robot", action="store_true", default=None,
+                        help=f"append {AGENT_MARKER} so the recipient can see an agent sent it")
+    marker.add_argument("--no-robot", dest="robot", action="store_false",
+                        help="send without the agent marker")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
+
+
+def _resolve_marker_choice(robot: bool | None) -> bool | None:
+    """Decide whether to mark, asking a human but never guessing for a program.
+
+    A non-interactive caller that says nothing gets refused rather than
+    defaulted. Silence from an agent is not consent to send unmarked.
+    """
+    if robot is not None:
+        return robot
+    if not sys.stdin.isatty():
+        print(
+            "error: pass --robot or --no-robot when not running interactively",
+            file=sys.stderr,
+        )
+        return None
+    answer = input(f"Mark this as sent by an agent ({AGENT_MARKER})? [Y/n] ").strip().lower()
+    return answer not in {"n", "no"}
+
+
+def _run_send(args: argparse.Namespace) -> int:
+    if args.message is None and args.message_file is None:
+        print("error: --send needs --message or --message-file", file=sys.stderr)
+        return 1
+
+    try:
+        chat_id = resolve_chat(args.chat, args.contact)
+        text = (
+            args.message_file.read_text(encoding="utf-8")
+            if args.message_file is not None
+            else args.message
+        )
+    except (ScopeError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    robot = _resolve_marker_choice(args.robot)
+    if robot is None:
+        return 1
+
+    try:
+        send_message(chat_id, text, robot=robot)
+    except (ScopeError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"sent to {chat_id}{' ' + AGENT_MARKER if robot else ''}", file=sys.stderr)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -238,6 +356,9 @@ def main(argv: list[str] | None = None) -> int:
         for name, ident in sorted(contacts.items()):
             print(f"{name}\t{ident}")
         return 0
+
+    if args.send:
+        return _run_send(args)
 
     try:
         chat_id = resolve_chat(args.chat, args.contact)

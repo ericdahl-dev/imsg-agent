@@ -205,3 +205,93 @@ def test_missing_database_raises(tmp_path):
 def test_render_is_readable():
     m = Message(date="2026-08-19T14:30:00+00:00", from_me=False, text="hi", has_attachment=True)
     assert m.render() == "2026-08-19 14:30  them  hi [attachment]"
+
+
+# --- sending -----------------------------------------------------------------
+
+def test_agent_marker_is_appended_when_requested():
+    from imsgread import mark_agent_sent
+
+    assert mark_agent_sent("Photos are fixed", robot=True) == "Photos are fixed 🤖"
+
+
+def test_text_is_untouched_when_not_marking():
+    from imsgread import mark_agent_sent
+
+    assert mark_agent_sent("Photos are fixed", robot=False) == "Photos are fixed"
+
+
+def test_send_requires_a_chat_identifier():
+    from imsgread import ScopeError, send_message
+
+    for empty in ("", "   ", None):
+        with pytest.raises(ScopeError):
+            send_message(empty, "hi", robot=False)
+
+
+def test_send_refuses_an_empty_body():
+    from imsgread import send_message
+
+    with pytest.raises(ValueError):
+        send_message("+15555550123", "   ", robot=False)
+
+
+def test_send_passes_the_marked_text_to_applescript(monkeypatch, tmp_path):
+    from imsgread import send_message
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        # The body is handed over via a file: inline quoting mangles
+        # apostrophes and emoji.
+        seen["cmd"] = cmd
+        body_path = next(a for a in cmd if a.endswith(".txt"))
+        seen["body"] = Path(body_path).read_text(encoding="utf-8")
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("+15555550123", "Photos are fixed", robot=True)
+
+    assert seen["body"] == "Photos are fixed 🤖"
+    assert "+15555550123" in " ".join(seen["cmd"])
+
+
+def test_non_interactive_send_must_state_the_marker_choice(monkeypatch, capsys):
+    """An agent cannot send unmarked by omission."""
+    from imsgread import main
+
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+
+    code = main(["--send", "--chat", "+15555550123", "--message", "hi"])
+
+    assert code != 0
+    assert "--robot" in capsys.readouterr().err
+
+
+def test_non_interactive_send_proceeds_when_told(monkeypatch):
+    from imsgread import main
+
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot: seen.update(chat=chat, text=text, robot=robot))
+
+    assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--robot"]) == 0
+    assert seen == {"chat": "+15555550123", "text": "hi", "robot": True}
+
+
+def test_interactive_send_asks_before_marking(monkeypatch):
+    from imsgread import main
+
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot: seen.update(robot=robot))
+
+    assert main(["--send", "--chat", "+15555550123", "--message", "hi"]) == 0
+    assert seen["robot"] is False
