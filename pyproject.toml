@@ -1,7 +1,7 @@
 [project]
-name = "imsg-read"
+name = "imsg-agent"
 version = "0.1.0"
-description = "Read a single iMessage thread from chat.db, decoded and scoped"
+description = "Scoped iMessage read/send for agents - decodes chat.db, marks agent-sent messages"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -9,7 +9,7 @@ dependencies = []
 dev = ["pytest>=8"]
 
 [project.scripts]
-imsg-read = "imsgread:main"
+imsg-agent = "imsgread:main"
 
 [build-system]
 requires = ["setuptools>=68"]

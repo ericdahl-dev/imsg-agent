@@ -1,4 +1,4 @@
-# imsg-read
+# imsg-agent
 
 Read a single iMessage thread from `chat.db` — decoded and scoped — and send
 to one, marked when an agent wrote it.
