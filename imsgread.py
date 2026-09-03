@@ -271,7 +271,7 @@ def send_message(chat: str | None, text: str, *, robot: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="imsg-read",
+        prog="imsg-agent",
         description="Read one iMessage thread from chat.db, decoded and scoped.",
         epilog="A chat identifier is always required; there is no unscoped mode.",
     )
