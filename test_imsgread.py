@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+REPO_ROOT = Path(__file__).parent
+
 import imsgread
 from imsgread import (
     Message,
@@ -293,5 +295,25 @@ def test_interactive_send_asks_before_marking(monkeypatch):
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot: seen.update(robot=robot))
 
-    assert main(["--send", "--chat", "+15555550123", "--message", "hi"]) == 0
+    assert main(["--send", "--chat", "+155****0123", "--message", "hi"]) == 0
     assert seen["robot"] is False
+
+
+# --- Claude skill ------------------------------------------------------------
+
+def test_claude_skill_documents_safe_scoped_usage():
+    skill = REPO_ROOT / ".claude" / "skills" / "imsg-agent" / "SKILL.md"
+    body = skill.read_text(encoding="utf-8")
+
+    required = [
+        "name: imsg-agent",
+        "Always scope every read or send to one `--contact` or one `--chat` identifier.",
+        "Prefer `--contact NAME` from `contacts.toml`",
+        "Do not query `~/Library/Messages/chat.db` directly",
+        "use `--robot` so the outgoing message is marked with 🤖",
+        "Prefer `--message-file`",
+        "python3 imsgread.py --contact disco -n 20 --text",
+        "python3 imsgread.py --send --contact disco --message-file reply.txt --robot",
+    ]
+    for text in required:
+        assert text in body
