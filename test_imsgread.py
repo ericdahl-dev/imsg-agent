@@ -308,12 +308,13 @@ def test_claude_skill_documents_safe_scoped_usage():
     required = [
         "name: imsg-agent",
         "Always scope every read or send to one `--contact` or one `--chat` identifier.",
-        "Prefer `--contact NAME` from `contacts.toml`",
+        "Prefer `--contact CONTACT_NAME` from `contacts.toml`",
+        "`CONTACT_NAME` is a configured contact alias, not a literal name to copy.",
         "Do not query `~/Library/Messages/chat.db` directly",
         "use `--robot` so the outgoing message is marked with 🤖",
         "Prefer `--message-file`",
-        "python3 imsgread.py --contact disco -n 20 --text",
-        "python3 imsgread.py --send --contact disco --message-file reply.txt --robot",
+        "python3 imsgread.py --contact CONTACT_NAME -n 20 --text",
+        "python3 imsgread.py --send --contact CONTACT_NAME --message-file reply.txt --robot",
     ]
     for text in required:
         assert text in body

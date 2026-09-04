@@ -12,7 +12,7 @@ Use this skill when you need to read or send iMessages from Claude Code on a Mac
 ## Safety rules
 
 - Always scope every read or send to one `--contact` or one `--chat` identifier.
-- Prefer `--contact NAME` from `contacts.toml` so phone numbers stay out of shell history, CI logs, and agent transcripts.
+- Prefer `--contact CONTACT_NAME` from `contacts.toml` so phone numbers stay out of shell history, CI logs, and agent transcripts. `CONTACT_NAME` is a configured contact alias, not a literal name to copy.
 - Never read across all chats. This tool has no unscoped mode; do not try to bypass that with SQL.
 - Never send to “the last conversation” or any inferred recipient. Resolve the target explicitly.
 - For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
@@ -31,7 +31,7 @@ python3 imsgread.py --contacts
 Read the latest messages for one contact as human-readable text:
 
 ```bash
-python3 imsgread.py --contact disco -n 20 --text
+python3 imsgread.py --contact CONTACT_NAME -n 20 --text
 ```
 
 Read the latest messages for one explicit chat identifier as JSON:
@@ -43,20 +43,20 @@ python3 imsgread.py --chat +155****0123 -n 50
 Read oldest-first when you need conversation flow:
 
 ```bash
-python3 imsgread.py --contact disco -n 50 --oldest-first --text
+python3 imsgread.py --contact CONTACT_NAME -n 50 --oldest-first --text
 ```
 
 Draft a message in a file, then send it marked as agent-authored:
 
 ```bash
 printf '%s\n' 'On my way.' > reply.txt
-python3 imsgread.py --send --contact disco --message-file reply.txt --robot
+python3 imsgread.py --send --contact CONTACT_NAME --message-file reply.txt --robot
 ```
 
 Send unmarked only when the user explicitly asks for that:
 
 ```bash
-python3 imsgread.py --send --contact disco --message-file reply.txt --no-robot
+python3 imsgread.py --send --contact CONTACT_NAME --message-file reply.txt --no-robot
 ```
 
 ## Expected workflow
@@ -71,8 +71,8 @@ python3 imsgread.py --send --contact disco --message-file reply.txt --no-robot
 
 ```bash
 sqlite3 ~/Library/Messages/chat.db 'select * from message limit 100;'
-osascript -e 'tell application "Messages" to send "hi" to buddy "+15551230123"'
-python3 imsgread.py --send --contact disco --message 'it works'
+osascript -e 'tell application "Messages" to send "hi" to buddy "+155****0123"'
+python3 imsgread.py --send --contact CONTACT_NAME --message 'it works'
 ```
 
 The first command is unscoped, the second leaks a phone number into command history, and the third is unsafe for non-interactive agents because it does not state whether the message should be marked.
