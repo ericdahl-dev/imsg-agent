@@ -114,7 +114,7 @@ def test_resolve_chat_passes_through_explicit_id():
 
 
 def test_resolve_chat_rejects_unknown_contact(monkeypatch):
-    monkeypatch.setattr(imsgread, "load_contacts", lambda *a, **k: {"disco": "+1555"})
+    monkeypatch.setattr(imsgread, "load_contacts", lambda *a, **k: {"friend": "+1555"})
     with pytest.raises(ScopeError, match="unknown contact"):
         resolve_chat(None, "nobody")
 
@@ -280,10 +280,10 @@ def test_non_interactive_send_proceeds_when_told(monkeypatch):
     seen = {}
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("imsgread.send_message",
-                        lambda chat, text, robot: seen.update(chat=chat, text=text, robot=robot))
+                        lambda chat, text, robot, **kw: seen.update(chat=chat, text=text, robot=robot, **kw))
 
     assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--robot"]) == 0
-    assert seen == {"chat": "+15555550123", "text": "hi", "robot": True}
+    assert (seen["chat"], seen["text"], seen["robot"]) == ("+15555550123", "hi", True)
 
 
 def test_interactive_send_asks_before_marking(monkeypatch):
@@ -293,7 +293,7 @@ def test_interactive_send_asks_before_marking(monkeypatch):
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "n")
     monkeypatch.setattr("imsgread.send_message",
-                        lambda chat, text, robot: seen.update(robot=robot))
+                        lambda chat, text, robot, **kw: seen.update(robot=robot, **kw))
 
     assert main(["--send", "--chat", "+155****0123", "--message", "hi"]) == 0
     assert seen["robot"] is False
@@ -307,6 +307,13 @@ def test_claude_skill_documents_safe_scoped_usage():
 
     required = [
         "name: imsg-agent",
+        # the description is what makes the skill fire without a slash command,
+        # so it has to carry the words a person actually uses
+        "text someone",
+        "check what someone said",
+        # a name is not an identifier: resolve it, never guess which number
+        "imsg-agent --contacts",
+        "never guess which identifier a name refers to",
         "Always scope every read or send to one `--contact` or one `--chat` identifier.",
         "Prefer `--contact CONTACT_NAME` from `contacts.toml`",
         "`CONTACT_NAME` is a configured contact alias, not a literal name to copy.",
@@ -321,8 +328,96 @@ def test_claude_skill_documents_safe_scoped_usage():
         # UTC output has been misread as local time
         "Timestamps are printed in UTC.",
         "Prefer `--message-file`",
-        "python3 imsgread.py --contact CONTACT_NAME -n 20 --text",
-        "python3 imsgread.py --send --contact CONTACT_NAME --message-file reply.txt --robot",
+        # commands must be the installed executable, not a path relative to
+        # the repo root -- the skill is used from other projects' directories
+        "imsg-agent --contact CONTACT_NAME -n 20 --text",
+        "imsg-agent --send --contact CONTACT_NAME --message-file reply.txt --robot",
+        "they work from any working directory",
+        "command not found",
     ]
     for text in required:
         assert text in body
+
+    assert "python3 imsgread.py" not in body, (
+        "skill commands must not be repo-relative: they break from any other cwd"
+    )
+
+
+# --- contacts file lookup ----------------------------------------------------
+
+def write_contacts(path: Path, name: str, ident: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'[contacts]\n{name} = "{ident}"\n', encoding="utf-8")
+    return path
+
+
+def test_contacts_env_var_wins_over_config_dir(tmp_path, monkeypatch):
+    env_file = write_contacts(tmp_path / "env.toml", "fromenv", "+1555")
+    config = write_contacts(tmp_path / "config.toml", "fromconfig", "+1666")
+    monkeypatch.setenv(imsgread.CONTACTS_ENV, str(env_file))
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+
+    assert imsgread.contacts_path() == env_file
+    assert imsgread.load_contacts() == {"fromenv": "+1555"}
+
+
+def test_contacts_falls_back_to_config_dir(tmp_path, monkeypatch):
+    config = write_contacts(tmp_path / "config.toml", "fromconfig", "+1666")
+    monkeypatch.delenv(imsgread.CONTACTS_ENV, raising=False)
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+    monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", tmp_path / "absent.toml")
+
+    assert imsgread.contacts_path() == config
+    assert imsgread.load_contacts() == {"fromconfig": "+1666"}
+
+
+def test_contacts_falls_back_to_file_beside_module(tmp_path, monkeypatch):
+    """A clone or editable install keeps contacts.toml in the repo root."""
+    bundled = write_contacts(tmp_path / "bundled.toml", "frombundle", "+1777")
+    monkeypatch.delenv(imsgread.CONTACTS_ENV, raising=False)
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", tmp_path / "absent.toml")
+    monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", bundled)
+
+    assert imsgread.contacts_path() == bundled
+    assert imsgread.load_contacts() == {"frombundle": "+1777"}
+
+
+def test_contacts_path_points_at_config_dir_when_nothing_exists(tmp_path, monkeypatch):
+    """The path suggested to the user must be one they can actually write to,
+    never a site-packages directory an upgrade would wipe."""
+    config = tmp_path / "config" / "imsg-agent" / "contacts.toml"
+    monkeypatch.delenv(imsgread.CONTACTS_ENV, raising=False)
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+    monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", tmp_path / "absent.toml")
+
+    assert imsgread.contacts_path() == config
+    assert imsgread.load_contacts() == {}
+
+
+def test_contacts_file_flag_overrides_every_default(tmp_path, monkeypatch):
+    explicit = write_contacts(tmp_path / "explicit.toml", "friend", "+1888")
+    monkeypatch.setenv(imsgread.CONTACTS_ENV, str(write_contacts(
+        tmp_path / "env.toml", "other", "+1999")))
+
+    assert imsgread.resolve_chat(None, "friend", explicit) == "+1888"
+
+
+def test_resolve_chat_honours_contacts_file_from_cli(tmp_path, monkeypatch, capsys):
+    explicit = write_contacts(tmp_path / "explicit.toml", "friend", "+1888")
+    seen = {}
+    monkeypatch.setattr(imsgread, "send_message",
+                        lambda chat, text, robot, **kw: seen.update(chat=chat, **kw))
+
+    assert imsgread.main([
+        "--send", "--contact", "friend", "--message", "hi", "--robot",
+        "--contacts-file", str(explicit),
+    ]) == 0
+    assert seen["chat"] == "+1888"
+
+
+def test_send_script_never_brings_messages_to_the_front():
+    """Sending must not steal focus. `activate` does; `launch` starts Messages
+    in the background when it is not already running. There is no way to assert
+    this without a GUI, so the requirement is pinned on the script itself."""
+    assert "activate" not in imsgread.SEND_SCRIPT
+    assert "launch" in imsgread.SEND_SCRIPT

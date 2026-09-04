@@ -1,8 +1,12 @@
-# Copy to contacts.toml and fill in. contacts.toml is gitignored -- real
-# identifiers never get committed.
+# Copy to ~/.config/imsg-agent/contacts.toml and fill in. A copy in the repo
+# root works too and is gitignored -- either way, real identifiers never get
+# committed.
 #
 # Named contacts keep phone numbers out of shell history, CI logs, and agent
-# transcripts. Callers pass `--contact disco` instead of the raw number.
+# transcripts. Callers pass `--contact friend` instead of the raw number.
+#
+# The name on the left is yours to choose; the value is the chat identifier
+# iMessage uses -- a phone number in +E.164 form, or an email address.
 
 [contacts]
-disco = "+15555550123"
+friend = "+15555550123"

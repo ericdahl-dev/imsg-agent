@@ -8,9 +8,9 @@ different `AGENTS.md` files. Two copies of a privacy rule is where privacy
 rules start drifting.
 
 ```bash
-python3 imsgread.py --contact disco -n 20 --text
-python3 imsgread.py --chat +15555550123 -n 50 > thread.json
-python3 imsgread.py --send --contact disco --message-file reply.txt --robot
+imsg-agent --contact friend -n 20 --text
+imsg-agent --chat +15555550123 -n 50 > thread.json
+imsg-agent --send --contact friend --message-file reply.txt --robot
 ```
 
 ## Why this is code
@@ -31,7 +31,7 @@ depends on the reader choosing to follow it. This one does not.
 **Sending belongs here too, for the same reason reads do.** The alternative was
 a block of `osascript` copy-pasted into an `AGENTS.md`, with the phone number
 inline — which put the number into shell history and every agent transcript,
-the exact leak `contacts.toml` exists to prevent. `--send --contact disco` does
+the exact leak `contacts.toml` exists to prevent. `--send --contact friend` does
 not. Sending is scoped identically to reading: one identifier, no broadcast
 path, no "reply to whoever was last".
 
@@ -42,26 +42,90 @@ program — a non-interactive caller that passes neither `--robot` nor
 `--no-robot` is refused, because silence from an agent is not consent to send
 unmarked. A human at a terminal is simply asked.
 
+**The marker goes in the body, because a tapback cannot be trusted.** A 🤖
+reaction would read better than an appended emoji, and it is not supported on
+purpose. Messages' entire AppleScript dictionary is `login`, `logout`, `send` —
+reactions are not scriptable, so the only route is UI scripting through System
+Events. On macOS 26 the Messages accessibility tree exposes the transcript as
+nested `AXGroup`s with no addressable message bubbles, so there is nothing to
+attach a reaction to. Worse, the failure is quiet: an unattached tapback leaves
+a message the caller believes is marked and the recipient sees unmarked, which
+is the exact thing the marker exists to prevent. An appended emoji either goes
+out or the send fails.
+
+**Sending never steals focus.** The AppleScript uses `launch`, not `activate`,
+so Messages starts in the background if it is not already running and stays
+behind whatever you are doing.
+
 **It's cheaper.** An agent following prose instructions re-derives the SQL and
 re-implements the decoder on every run, then retries when the decode comes back
 empty. This is one call returning structured rows.
 
 ## Install
 
-Python 3.11+, no dependencies.
+Python 3.11+ and no runtime dependencies. macOS only — it reads Apple's
+`chat.db` and sends through Messages.
 
 ```bash
-cp contacts.toml.example contacts.toml   # then fill in
-python3 -m pytest -q                      # 21 tests, no network, no real data
+git clone https://github.com/ericdahl-dev/imsg-agent && cd imsg-agent
+pip install -e '.[dev]'    # installs the `imsg-agent` command, plus pytest
+python3 -m pytest -q       # 38 tests, no network, no real message data
 ```
 
-`contacts.toml` is gitignored. Named contacts keep phone numbers out of shell
-history, CI logs, and agent transcripts — callers pass `--contact disco`, not a
-raw number.
+`pip install -e .` alone is enough if you don't want to run the tests; pytest
+is the only dev dependency. The editable install is the recommended one — it
+keeps the checkout authoritative, so `git pull` is the upgrade.
+
+Then configure a contact:
+
+```bash
+mkdir -p ~/.config/imsg-agent
+cp contacts.toml.example ~/.config/imsg-agent/contacts.toml   # then fill in
+imsg-agent --contacts                                          # confirm
+```
+
+Contacts are searched for in this order, first hit wins:
+
+| Location | Use |
+| --- | --- |
+| `$IMSG_AGENT_CONTACTS` | explicit override for a shell or a session |
+| `~/.config/imsg-agent/contacts.toml` | normal install; survives upgrades |
+| `contacts.toml` beside the module | a clone or editable install, i.e. the repo root |
+
+`--contacts-file PATH` skips the search entirely and reads that file.
+
+The repo-root copy is gitignored, so a checkout never commits real identifiers.
+Named contacts keep phone numbers out of shell history, CI logs, and agent
+transcripts — callers pass `--contact friend`, not a raw number.
 
 **Full Disk Access is required.** Grant it to your terminal under
 System Settings → Privacy & Security → Full Disk Access, or every read fails
-with a permission error.
+with a permission error. Granting it does not reach a process that is already
+running — restart the terminal afterwards.
+
+## Install the Claude skill
+
+`.claude/skills/imsg-agent/SKILL.md` teaches an agent the safe usage: always
+scoped, `--message-file` over shell quoting, resolve a name to a contact rather
+than guessing, and never unmarked by default. Inside this repo Claude Code
+picks it up automatically. To use it from your other projects, link it into
+your personal skills directory:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$PWD/.claude/skills/imsg-agent" ~/.claude/skills/imsg-agent
+```
+
+Link rather than copy, deliberately. A copy is a second place the safety rules
+live, and it goes stale the first time the ones here change — the drift this
+repo exists to end. A symlink makes `git pull` the update.
+
+No slash command is needed: the skill's `description` is what makes an agent
+reach for it when you say "text Eric" or "what did she say yesterday". A new
+session picks up a changed description; an already-running one does not.
+
+Its commands call the installed `imsg-agent` executable rather than a path into
+this repo, so they work from whatever directory the agent happens to be in.
 
 ## Usage
 
@@ -74,6 +138,7 @@ with a permission error.
 --include-empty      keep rows with no body
 --db PATH            alternate chat.db
 --contacts           list configured contacts and exit
+--contacts-file PATH alternate contacts.toml for this run
 
 --send               send instead of reading
 --message TEXT       message body
@@ -100,6 +165,9 @@ JSON output, newest first:
 
 `has_attachment` is worth reading. A message can carry an image and no text at
 all, which for a thread where someone sends scans is signal, not noise.
+
+Or as a module, if you have a clone but no install: `python3 imsgread.py
+--contact friend -n 20 --text`.
 
 ## As a library
 
