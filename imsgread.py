@@ -783,22 +783,6 @@ tell application "Messages" to send t to chat id (item 2 of argv)
 end run"""
 
 
-# Attachments split the same way text does, and for the same reason: a chat
-# with a guid is addressed over its own service, and `participant` is only
-# correct for a first message to someone who has no chat row yet.
-CHAT_ATTACH_SCRIPT = """on run argv
-set f to POSIX file (item 1 of argv)
-launch application "Messages"
-tell application "Messages" to send f to chat id (item 2 of argv)
-end run"""
-
-ATTACH_SCRIPT = """on run argv
-set f to POSIX file (item 1 of argv)
-launch application "Messages"
-tell application "Messages" to send f to participant (item 2 of argv) of (first account whose service type is iMessage)
-end run"""
-
-
 # Messages raises this when chat.db holds a row it will not address: a chat
 # with yourself, or a thread Messages has since pruned.
 UNADDRESSABLE_CHAT = "-1728"
@@ -836,7 +820,6 @@ def send_message(
     *,
     robot: bool,
     guid: str | None = None,
-    attachment: Path | None = None,
 ) -> None:
     """Send one iMessage to one chat identifier.
 
@@ -859,25 +842,6 @@ def send_message(
         raise ScopeError("a chat identifier is required to send")
 
     script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
-
-    if attachment is not None:
-        # Checked before anything goes out: a send that half-delivers and then
-        # fails is worse than one that never started.
-        path = Path(attachment).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(f"no file at {path}")
-        _send_via(
-            CHAT_ATTACH_SCRIPT if guid else ATTACH_SCRIPT,
-            ATTACH_SCRIPT,
-            str(path.resolve()),
-            target,
-            identifier,
-        )
-        # A file has no body to carry the marker. Per the decision recorded
-        # for this tool it goes unmarked; a caption is ordinary text and does
-        # not, so it still runs through mark_agent_sent below.
-        if not (text or "").strip():
-            return
 
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
@@ -921,8 +885,6 @@ def build_parser() -> argparse.ArgumentParser:
     body = p.add_mutually_exclusive_group()
     body.add_argument("--message", help="message body (prefer --message-file for anything with quotes or emoji)")
     body.add_argument("--message-file", type=Path, help="file containing the message body, read as UTF-8")
-    p.add_argument("--file", type=Path, dest="attachment",
-                   help="image or file to send, with or without a message")
     marker = p.add_mutually_exclusive_group()
     marker.add_argument("--robot", dest="robot", action="store_true", default=None,
                         help=f"append {AGENT_MARKER} so the recipient can see an agent sent it")
@@ -1089,8 +1051,8 @@ def _run_find_groups(args: argparse.Namespace) -> int:
 
 
 def _run_send(args: argparse.Namespace) -> int:
-    if args.message is None and args.message_file is None and args.attachment is None:
-        print("error: --send needs --message, --message-file or --file", file=sys.stderr)
+    if args.message is None and args.message_file is None:
+        print("error: --send needs --message or --message-file", file=sys.stderr)
         return 1
 
     try:
@@ -1116,23 +1078,17 @@ def _run_send(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # A file carries no body, so there is nothing for a marker to attach to
-    # and nothing to ask about. Text still has to state the choice.
-    if text.strip():
-        robot = _resolve_marker_choice(args.robot, configured)
-        if robot is None:
-            return 1
-    else:
-        robot = bool(args.robot)
+    robot = _resolve_marker_choice(args.robot, configured)
+    if robot is None:
+        return 1
 
     # Recorded before the send so the row read back afterwards is certainly
     # the one this call produced.
     floor = last_sent_rowid(chat_id, args.db)
 
     try:
-        send_message(chat_id, text, robot=robot, guid=guid,
-                     attachment=args.attachment)
-    except (ScopeError, ValueError, RuntimeError, FileNotFoundError) as exc:
+        send_message(chat_id, text, robot=robot, guid=guid)
+    except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

@@ -18,10 +18,6 @@ The commands below call the installed `imsg-agent` executable, so they work from
 - Prefer `--contact CONTACT_NAME` from `contacts.toml` so phone numbers stay out of shell history, CI logs, and agent transcripts. `CONTACT_NAME` is a configured contact alias, not a literal name to copy.
 - Never read across all chats. This tool has no unscoped mode; do not try to bypass that with SQL.
 - Never send to “the last conversation” or any inferred recipient. Resolve the target explicitly.
-- An attachment cannot carry the marker. A file has no body to append 🤖 to, so
-  `--file` sends it unmarked even under `--robot`; only an accompanying message is
-  marked. Send a file on its own only when the recipient knowing an agent chose it
-  does not matter, and pair it with a marked line when it does.
 - The marker reflects whose words they are, not who typed them. For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
 - Use `--no-robot` only for words a human wrote or approved as their own, and only when they approved that specific message. Drafting in someone's voice and having them say "send it" is theirs; composing on their behalf unreviewed is yours.
 - A contact may carry a standing decision in `contacts.toml` (`marker = true` always marks, `marker = false` never does), which answers when no flag is passed. Where there is no such setting, omitting the choice in a non-interactive run is still refused -- an agent must not be able to send unmarked by default.
@@ -114,13 +110,10 @@ Messages prunes old files, so an attachment that is no longer on disk reports
 payload files that cannot be opened or forwarded, and the link is already in the
 message text.
 
-Send a file with `--file`, on its own or with a message:
-
-```bash
-imsg-agent --send --contact CONTACT_NAME --file ~/Pictures/shot.png --robot
-```
-
-Read the marker rule above before sending a file: the file itself goes unmarked.
+Attachments can only be read, not sent. `send <file> to participant` through
+AppleScript writes the bubble locally and fails to deliver (error 25 in
+chat.db) while osascript still exits 0, so there is deliberately no flag for
+it. Send an image by hand in Messages.
 
 ## Expected workflow
 

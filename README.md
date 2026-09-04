@@ -161,7 +161,6 @@ this repo, so they work from whatever directory the agent happens to be in.
 --message TEXT       message body
 --message-file PATH  body from a UTF-8 file (prefer this: inline quoting
                      mangles apostrophes and emoji)
---file PATH          image or file to send, with or without a message
 --robot              append 🤖 so the recipient can see an agent sent it
 --no-robot           send unmarked
 ```
@@ -219,15 +218,10 @@ $ imsg-agent --contact friend -n 5 --text
 2026-08-27 22:05  them  [image/png 196.3 KB ~/Library/Messages/Attachments/70/00/.../Screenshot.png]
 ```
 
-Send one with `--file`, alone or with a message:
-
-```
-$ imsg-agent --send --contact friend --file ~/Pictures/shot.png --robot
-```
-
-A file has no body to append 🤖 to, so an attachment always sends unmarked; only
-an accompanying message carries the marker. That is a deliberate choice, and it
-means a file alone tells the recipient nothing about who chose it.
+Reading only. Sending a file through AppleScript (`send <file> to
+participant`) writes the bubble into the thread locally and never delivers it
+-- chat.db records error 25 while osascript exits 0 -- so the tool does not
+offer it rather than reporting a success that did not happen.
 
 Or as a module, if you have a clone but no install: `python3 imsgread.py
 --contact friend -n 20 --text`.
