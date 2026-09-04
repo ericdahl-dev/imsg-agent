@@ -269,12 +269,17 @@ def mark_agent_sent(text: str, *, robot: bool) -> str:
     Provenance, not decoration: a person reading the thread months later should
     be able to see which messages a human typed. Appended rather than prefixed
     so the message still opens with its own first line.
+
+    Trailing whitespace goes first, on every path. A --message-file body is a
+    file, and files end in a newline, so leaving it would send a blank line to
+    the recipient on the strength of how the draft was saved.
     """
+    text = text.rstrip()
     if not robot:
         return text
-    if text.rstrip().endswith(AGENT_MARKER):
+    if text.endswith(AGENT_MARKER):
         return text
-    return f"{text.rstrip()} {AGENT_MARKER}"
+    return f"{text} {AGENT_MARKER}"
 
 
 # `launch` rather than `activate`: it starts Messages in the background if it is

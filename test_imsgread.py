@@ -223,6 +223,16 @@ def test_text_is_untouched_when_not_marking():
     assert mark_agent_sent("Photos are fixed", robot=False) == "Photos are fixed"
 
 
+def test_trailing_newline_from_a_message_file_never_reaches_the_recipient():
+    from imsgread import mark_agent_sent
+
+    # Drafts arrive from --message-file, and files end in a newline. Sending it
+    # shows up as a blank line on the recipient's phone.
+    assert mark_agent_sent("Photos are fixed\n", robot=False) == "Photos are fixed"
+    assert mark_agent_sent("Photos are fixed\n", robot=True) == "Photos are fixed \U0001F916"
+    assert mark_agent_sent("Photos are fixed \U0001F916\n", robot=True) == "Photos are fixed \U0001F916"
+
+
 def test_send_requires_a_chat_identifier():
     from imsgread import ScopeError, send_message
 
