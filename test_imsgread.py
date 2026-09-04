@@ -135,26 +135,41 @@ def db(tmp_path: Path) -> Path:
     conn.executescript(
         """
         create table message (ROWID integer primary key, date integer, is_from_me integer,
-                              text text, attributedBody blob, cache_has_attachments integer);
-        create table chat (ROWID integer primary key, chat_identifier text);
+                              text text, attributedBody blob, cache_has_attachments integer,
+                              handle_id integer);
+        create table chat (ROWID integer primary key, chat_identifier text, guid text,
+                           display_name text);
         create table chat_message_join (chat_id integer, message_id integer);
+        create table handle (ROWID integer primary key, id text);
+        create table chat_handle_join (chat_id integer, handle_id integer);
         """
     )
-    conn.execute("insert into chat values (1, '+15555550123')")
-    conn.execute("insert into chat values (2, '+15555559999')")
+    conn.execute("insert into chat values (1, '+15555550123', 'iMessage;-;+15555550123', null)")
+    conn.execute("insert into chat values (2, '+15555559999', 'iMessage;-;+15555559999', null)")
+    conn.execute("insert into chat values (3, 'chat9001', 'iMessage;+;chat9001', 'trail crew')")
+    conn.execute("insert into chat values (4, 'chat9002', null, 'no guid')")
+    for rowid, ident in ((1, "+15555550123"), (2, "+15555559999"), (3, "+15555551111")):
+        conn.execute("insert into handle values (?,?)", (rowid, ident))
+    # one-to-one chats have a single participant; the group has three
+    for chat, handle in ((1, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2)):
+        conn.execute("insert into chat_handle_join values (?,?)", (chat, handle))
 
-    def add(rowid, chat, date, from_me, text, blob, attach=0):
+    def add(rowid, chat, date, from_me, text, blob, attach=0, handle_id=None):
         conn.execute(
-            "insert into message values (?,?,?,?,?,?)", (rowid, date, from_me, text, blob, attach)
+            "insert into message values (?,?,?,?,?,?,?)",
+            (rowid, date, from_me, text, blob, attach, handle_id),
         )
         conn.execute("insert into chat_message_join values (?,?)", (chat, rowid))
 
     base = 700_000_000 * 10**9
-    add(1, 1, base + 1, 0, None, make_blob("first from them"))
+    add(1, 1, base + 1, 0, None, make_blob("first from them"), handle_id=1)
     add(2, 1, base + 2, 1, "plain text column wins", None)
-    add(3, 1, base + 3, 0, None, None, attach=1)          # attachment only
-    add(4, 1, base + 4, 0, None, None)                    # empty, should drop
-    add(5, 2, base + 5, 0, None, make_blob("OTHER THREAD"))
+    add(3, 1, base + 3, 0, None, None, attach=1, handle_id=1)   # attachment only
+    add(4, 1, base + 4, 0, None, None, handle_id=1)             # empty, should drop
+    add(5, 2, base + 5, 0, None, make_blob("OTHER THREAD"), handle_id=2)
+    add(6, 3, base + 6, 0, "from alice", None, handle_id=1)
+    add(7, 3, base + 7, 0, "from carol", None, handle_id=3)
+    add(8, 3, base + 8, 1, "from me", None)
     conn.commit()
     conn.close()
     return path
@@ -207,6 +222,34 @@ def test_missing_database_raises(tmp_path):
 def test_render_is_readable():
     m = Message(date="2026-08-19T14:30:00+00:00", from_me=False, text="hi", has_attachment=True)
     assert m.render() == "2026-08-19 14:30  them  hi [attachment]"
+
+
+def test_a_group_thread_attributes_each_sender(db):
+    """Collapsing a group into one word makes the transcript quotable but
+    misattributable, which is worse than not reading it at all."""
+    msgs = read_thread("chat9001", db_path=db)
+    said = {m.sender: m.text for m in msgs if not m.from_me}
+    assert len(said) == 2, said
+    assert set(said.values()) == {"from alice", "from carol"}
+    assert all(m.sender is None for m in msgs if m.from_me)
+
+
+def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
+    """The whole point of contacts.toml is that numbers stay out of output."""
+    msgs = read_thread("+15555550123", db_path=db)
+    assert all(m.sender is None for m in msgs)
+    rendered = "\n".join(m.render() for m in msgs)
+    assert "+15555550123" not in rendered
+    assert "them" in rendered
+
+
+def test_group_senders_use_a_known_name_and_mask_the_rest(db):
+    msgs = read_thread("chat9001", db_path=db,
+                       labels={"+15555550123": "alice"})
+    senders = {m.sender for m in msgs if not m.from_me}
+    assert "alice" in senders
+    assert "*1111" in senders          # unnamed participant, masked
+    assert "+15555551111" not in senders
 
 
 # --- sending -----------------------------------------------------------------
@@ -271,6 +314,68 @@ def test_send_passes_the_marked_text_to_applescript(monkeypatch, tmp_path):
     assert "+15555550123" in " ".join(seen["cmd"])
 
 
+def test_a_group_send_addresses_the_chat_not_a_participant(monkeypatch):
+    """`participant` resolves one handle. A group has to be addressed by its
+    guid, which carries the service prefix."""
+    from imsgread import send_message
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = " ".join(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("chat9001", "trail is open", robot=True, guid="iMessage;+;chat9001")
+
+    assert "iMessage;+;chat9001" in seen["cmd"]
+    assert "chat id" in seen["cmd"]
+
+
+def test_a_one_to_one_send_still_goes_to_a_participant(monkeypatch):
+    """Regression guard: adding the group branch must not reroute 1:1 sends."""
+    from imsgread import send_message
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = " ".join(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("+15555550123", "hi", robot=False)
+
+    assert "participant" in seen["cmd"]
+    assert "chat id" not in seen["cmd"]
+
+
+def test_the_group_script_never_brings_messages_to_the_front():
+    """Same requirement as the 1:1 script, pinned separately so a new script
+    cannot quietly reintroduce focus stealing."""
+    assert "activate" not in imsgread.CHAT_SEND_SCRIPT
+    assert "launch" in imsgread.CHAT_SEND_SCRIPT
+
+
+def test_a_group_with_no_guid_is_refused_rather_than_guessed(tmp_path, monkeypatch, capsys, db):
+    """No guid means the group cannot be addressed. Falling back to
+    `participant` would send to one member instead of the group."""
+    from imsgread import main
+
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda *a, **k: pytest.fail("must not send"))
+    code = main(["--send", "--chat", "chat9002", "--message", "hi",
+                 "--robot", "--db", str(db)])
+
+    assert code != 0
+    assert "group" in capsys.readouterr().err.lower()
+
+
 def test_non_interactive_send_must_state_the_marker_choice(monkeypatch, capsys):
     """An agent cannot send unmarked by omission."""
     from imsgread import main
@@ -333,6 +438,10 @@ def test_claude_skill_documents_safe_scoped_usage():
         # go unmarked even though an agent typed them
         "The marker reflects whose words they are, not who typed them.",
         "only for words a human wrote or approved as their own",
+        # the marker default is the one value allowed to answer for a program,
+        # so an agent writing it would be granting itself permission
+        "Never write that setting yourself.",
+        "refuses to run without a terminal",
         # granting Full Disk Access does not reach an already-running process
         "restart the session afterwards",
         # UTC output has been misread as local time
@@ -431,3 +540,319 @@ def test_send_script_never_brings_messages_to_the_front():
     this without a GUI, so the requirement is pinned on the script itself."""
     assert "activate" not in imsgread.SEND_SCRIPT
     assert "launch" in imsgread.SEND_SCRIPT
+
+
+# --- per-contact marker default ----------------------------------------------
+
+def write_toml(path: Path, body: str) -> Path:
+    """write_contacts only emits the plain form; these need the table form too."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def send_args(cfg: Path, *extra: str) -> list[str]:
+    return ["--send", "--contact", "eric", "--message", "hi",
+            "--contacts-file", str(cfg), *extra]
+
+
+def test_both_contact_forms_load_from_one_file(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\n'
+        'brian = "+1555"\n'
+        'eric = { id = "+1666", marker = false }\n'
+        'mom = { id = "+1777", marker = true }\n'
+    ))
+    entries = imsgread.load_contact_entries(cfg)
+
+    assert entries["brian"] == imsgread.Contact("+1555", None)
+    assert entries["eric"] == imsgread.Contact("+1666", False)
+    assert entries["mom"] == imsgread.Contact("+1777", True)
+    # the old contract is what every other caller still uses
+    assert imsgread.load_contacts(cfg) == {"brian": "+1555", "eric": "+1666", "mom": "+1777"}
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ('[contacts]\neric = { marker = false }\n', "no 'id'"),
+    ('[contacts]\neric = { id = "+1", marekr = false }\n', "unknown key"),
+    ('[contacts]\neric = { id = "+1", marker = "never" }\n', "non-boolean"),
+    ('[contacts]\neric = 12\n', "must be an identifier or a table"),
+])
+def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
+    """A silently ignored marker is the worst outcome: the caller believes a
+    standing decision is in force while every send does the opposite."""
+    cfg = write_toml(tmp_path / "c.toml", body)
+    with pytest.raises(imsgread.ConfigError) as exc:
+        imsgread.load_contact_entries(cfg)
+    assert fragment in str(exc.value)
+    assert "eric" in str(exc.value)
+
+
+@pytest.mark.parametrize("stored, expected", [("false", False), ("true", True)])
+def test_a_contact_default_answers_for_a_program(tmp_path, monkeypatch, stored, expected):
+    """The one behaviour change: silence now resolves to a decision a person
+    recorded, instead of being refused."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(chat=chat, robot=robot))
+
+    assert main(send_args(cfg)) == 0
+    assert seen == {"chat": "+1555", "robot": expected}
+
+
+@pytest.mark.parametrize("stored, flag, expected", [
+    ("false", "--robot", True),
+    ("true", "--no-robot", False),
+])
+def test_an_explicit_flag_beats_the_contact_default(tmp_path, monkeypatch, stored, flag, expected):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(robot=robot))
+
+    assert main(send_args(cfg, flag)) == 0
+    assert seen["robot"] is expected
+
+
+def test_a_contact_without_a_setting_still_refuses(tmp_path, monkeypatch, capsys):
+    """Unchanged behaviour for everyone who has not opted in."""
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+
+    assert main(send_args(cfg)) != 0
+    assert "--robot" in capsys.readouterr().err
+
+
+def test_a_raw_chat_identifier_ignores_any_contact_default(tmp_path, monkeypatch, capsys):
+    """--chat is not a contact, so there is nowhere a decision could have been
+    recorded -- even when the same number is configured."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+
+    assert main(["--send", "--chat", "+1555", "--message", "hi",
+                 "--contacts-file", str(cfg)]) != 0
+    assert "--robot" in capsys.readouterr().err
+
+
+def test_contacts_listing_shows_a_setting_only_when_set(tmp_path, capsys):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\nbrian = "+1555"\neric = { id = "+1666", marker = false }\n'
+    ))
+    assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["brian\t+1555", "eric\t+1666\tmarker=never"]
+
+
+# --- writing the config ------------------------------------------------------
+
+def test_writing_a_contact_keeps_the_rest_of_the_file(tmp_path):
+    """Rewriting from parsed data would drop a person's own comments."""
+    cfg = write_toml(tmp_path / "c.toml", (
+        "# my header\n\n[contacts]\n# brian is my brother\n"
+        'brian = "+1555"\ndisco = "+1666"\n'
+    ))
+    imsgread.write_contact("brian", imsgread.Contact("+1555", True), cfg)
+    imsgread.write_contact("eric", imsgread.Contact("+1777", False), cfg)
+
+    text = cfg.read_text()
+    assert "# my header" in text
+    assert "# brian is my brother" in text
+    assert 'brian = { id = "+1555", marker = true }' in text
+    assert 'disco = "+1666"' in text
+    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1777", False)
+
+
+def test_clearing_a_setting_returns_the_plain_form(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    imsgread.write_contact("eric", imsgread.Contact("+1555", None), cfg)
+
+    assert 'eric = "+1555"' in cfg.read_text()
+
+
+def test_a_contact_that_would_break_the_file_is_refused(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml", '[contacts]\n')
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("eric", imsgread.Contact('+1" , evil = "yes'), cfg)
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("not a name", imsgread.Contact("+1555"), cfg)
+
+
+def test_a_write_that_would_corrupt_the_file_is_refused(tmp_path):
+    """A [contacts.name] subtable reads fine but is invisible to a scan of the
+    [contacts] table, so a naive insert would define the contact twice."""
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\nbrian = "+1555"\n\n[contacts.eric]\nid = "+1666"\nmarker = false\n'
+    ))
+    before = cfg.read_text()
+
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("eric", imsgread.Contact("+1666", True), cfg)
+
+    assert cfg.read_text() == before
+    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1666", False)
+
+
+def test_config_mode_refuses_without_a_terminal(tmp_path, monkeypatch, capsys):
+    """The mitigation is enforced, not documented: an agent cannot reach the
+    code that would let it give itself a marker default."""
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+
+    assert main(["--config", "--contacts-file", str(cfg)]) != 0
+    assert "human at a terminal" in capsys.readouterr().err
+    assert imsgread.load_contact_entries(cfg)["eric"].marker is None
+
+
+@pytest.mark.parametrize("word, expected", [
+    ("never", False), ("always", True), ("ask", None),
+])
+def test_config_mode_records_a_decision(tmp_path, monkeypatch, word, expected):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    replies = iter([f"set eric marker {word}", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    assert imsgread.load_contact_entries(cfg)["eric"].marker is expected
+
+
+def test_config_mode_adds_a_contact_and_keeps_its_decision(tmp_path, monkeypatch):
+    """Repointing someone at a new number is not a reason to forget the
+    decision already made about them."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    replies = iter(["add mom +1777", "add eric +1888", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    entries = imsgread.load_contact_entries(cfg)
+    assert entries["mom"] == imsgread.Contact("+1777", None)
+    assert entries["eric"] == imsgread.Contact("+1888", False)
+
+
+def test_config_mode_survives_a_bad_command(tmp_path, monkeypatch, capsys):
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    replies = iter(["nonsense", "set nobody marker never", "set eric marker sometimes", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    assert "unknown command" in out
+    assert "unknown contact" in out
+    assert "marker must be one of" in out
+
+
+# --- finding groups ----------------------------------------------------------
+
+def test_find_groups_lists_only_groups_the_contact_is_in(tmp_path, capsys, db):
+    """A group id cannot be guessed, so something has to hand it over -- but
+    scoped to one participant, never a dump of every conversation."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\nalice = "+15555550123"\n')
+    code = main(["--find-groups", "--contact", "alice",
+                 "--contacts-file", str(cfg), "--db", str(db)])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "chat9001" in out
+    assert "trail crew" in out
+    assert "+15555559999" not in out       # the 1:1 chat is not a group
+    assert "+15555550123" not in out       # and no numbers in the listing
+
+
+def test_find_groups_refuses_without_a_participant(capsys, db):
+    """No participant would mean enumerating every group on the machine."""
+    from imsgread import main
+
+    assert main(["--find-groups", "--db", str(db)]) != 0
+    assert "error" in capsys.readouterr().err.lower()
+
+
+def test_a_group_send_honours_the_alias_marker(tmp_path, monkeypatch, db):
+    """Per the decision recorded for this tool: a group alias carries one
+    marker setting, exactly like a one-to-one contact."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\ncrew = { id = "chat9001", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, **k: seen.update(chat=chat, **k))
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+
+    code = main(["--send", "--contact", "crew", "--message", "hi",
+                 "--contacts-file", str(cfg), "--db", str(db)])
+
+    assert code == 0
+    assert seen["robot"] is True            # no flag passed; the alias decided
+    assert seen["guid"] == "iMessage;+;chat9001"
+
+
+def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, monkeypatch):
+    """A green thread is only reachable through its own guid. The participant
+    path is pinned to the iMessage account, so addressing an SMS or RCS chat
+    that way writes the message into the thread and never delivers it."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: ("any;-;+1555", 1))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] == "any;-;+1555"
+
+
+def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch):
+    """Nobody has a chat row before the first message. That is the one case
+    where addressing a participant directly is the only option."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: (None, 0))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] is None

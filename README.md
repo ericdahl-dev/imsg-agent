@@ -42,6 +42,22 @@ program — a non-interactive caller that passes neither `--robot` nor
 `--no-robot` is refused, because silence from an agent is not consent to send
 unmarked. A human at a terminal is simply asked.
 
+**One marker decision per contact, made once.** In practice the right choice is
+the same for a given person every time, so a contact can carry a standing one:
+
+```toml
+[contacts]
+brian = "+15555550123"                              # asked per message
+eric  = { id = "+15555550124", marker = false }     # never marked
+```
+
+An explicit flag still wins; a contact with no setting behaves exactly as
+before. This is the one place a value may answer for a program that said
+nothing, which is a real weakening of the rule above and only sound while a
+person is the one who wrote it. So the setting is not editable by a program:
+`imsg-agent --config` refuses to run without a terminal. A config file an agent
+can write is not a record of consent, it is a note the agent left itself.
+
 **The marker goes in the body, because a tapback cannot be trusted.** A 🤖
 reaction would read better than an appended emoji, and it is not supported on
 purpose. Messages' entire AppleScript dictionary is `login`, `logout`, `send` —

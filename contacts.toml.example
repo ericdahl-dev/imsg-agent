@@ -8,5 +8,14 @@
 # The name on the left is yours to choose; the value is the chat identifier
 # iMessage uses -- a phone number in +E.164 form, or an email address.
 
+# A bare identifier leaves the agent marker to be chosen per message. A table
+# adds a standing decision for that person: `marker = true` always appends 🤖,
+# `marker = false` never does. An explicit --robot/--no-robot still wins.
+#
+# Set it with `imsg-agent --config`, which only runs at a terminal: the setting
+# is what lets a value answer for a program that passed no flag, so it has to
+# be a person's decision rather than one an agent made for itself.
+
 [contacts]
 friend = "+15555550123"
+colleague = { id = "+15555550124", marker = true }

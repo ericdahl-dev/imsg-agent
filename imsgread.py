@@ -57,6 +57,15 @@ class ScopeError(ValueError):
     """Raised when a read is attempted without a chat identifier."""
 
 
+class ConfigError(ValueError):
+    """Raised when contacts.toml cannot be understood.
+
+    Separate from ScopeError because the fix is different: a scope error means
+    the caller must say who they mean, a config error means a file on disk is
+    wrong and every command will keep failing until it is edited.
+    """
+
+
 # --------------------------------------------------------------------------
 # typedstream decoding
 # --------------------------------------------------------------------------
@@ -140,16 +149,211 @@ def contacts_path() -> Path:
     return CONFIG_CONTACTS
 
 
-def load_contacts(path: Path | None = None) -> dict[str, str]:
-    """Map friendly names to chat identifiers, so callers pass `friend` rather
-    than a phone number. Keeps raw numbers out of shell history and logs."""
+@dataclass(frozen=True)
+class Contact:
+    """One entry from contacts.toml.
+
+    `marker` records a standing decision about the agent marker for this
+    person: True always marks, False never does, and None means no decision
+    was recorded, which is the behaviour this tool has always had -- ask a
+    human, refuse a program.
+    """
+
+    identifier: str
+    marker: bool | None = None
+
+
+# The config vocabulary. `ask` is the absence of a decision rather than a third
+# state, so it is stored by leaving the key out entirely.
+MARKER_WORDS: dict[str, bool | None] = {"always": True, "never": False, "ask": None}
+
+
+def marker_word(marker: bool | None) -> str:
+    """The word a person types, for a stored value."""
+    for word, value in MARKER_WORDS.items():
+        if value is marker:
+            return word
+    raise ValueError(f"not a marker value: {marker!r}")
+
+
+def _parse_contact(name: str, value: object) -> Contact:
+    """Accept either form: a bare identifier, or a table carrying settings.
+
+    Unknown keys are an error rather than ignored. A silently inert `marker`
+    setting is the worst outcome here: the caller believes a standing decision
+    is in force and every send quietly does the opposite.
+    """
+    if isinstance(value, str):
+        return Contact(value)
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"contact {name!r} must be an identifier or a table, got {type(value).__name__}"
+        )
+    unknown = sorted(set(value) - {"id", "marker"})
+    if unknown:
+        raise ConfigError(
+            f"contact {name!r} has unknown key(s): {', '.join(unknown)} "
+            f"(expected 'id' and optionally 'marker')"
+        )
+    identifier = value.get("id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise ConfigError(f"contact {name!r} is a table but has no 'id'")
+    marker = value.get("marker")
+    if marker is not None and not isinstance(marker, bool):
+        raise ConfigError(
+            f"contact {name!r} has a non-boolean 'marker' "
+            f"(use true, false, or leave it out to be asked)"
+        )
+    return Contact(identifier, marker)
+
+
+def load_contact_entries(path: Path | None = None) -> dict[str, Contact]:
+    """Every contact with its settings."""
     if path is None:
         path = contacts_path()
     if not path.exists():
         return {}
     with path.open("rb") as fh:
-        data = tomllib.load(fh)
-    return {k: str(v) for k, v in data.get("contacts", {}).items()}
+        try:
+            data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+    return {k: _parse_contact(k, v) for k, v in data.get("contacts", {}).items()}
+
+
+def load_contacts(path: Path | None = None) -> dict[str, str]:
+    """Map friendly names to chat identifiers, so callers pass `friend` rather
+    than a phone number. Keeps raw numbers out of shell history and logs."""
+    return {k: c.identifier for k, c in load_contact_entries(path).items()}
+
+
+def contact_marker(
+    contact: str | None,
+    contacts_file: Path | None = None,
+) -> bool | None:
+    """The standing marker decision for a contact, or None if there is none.
+
+    None for `--chat` too: a raw identifier is not a contact, so there is
+    nowhere for a decision to have been recorded and the caller is asked or
+    refused exactly as before.
+    """
+    if not contact:
+        return None
+    return load_contact_entries(contacts_file).get(contact, Contact("")).marker
+
+
+CONTACTS_HEADER = """# imsg-agent contacts. Named contacts keep phone numbers out of shell history,
+# CI logs, and agent transcripts: callers pass `--contact friend`.
+#
+# A bare identifier leaves the agent marker to be chosen per message. A table
+# with `marker = true` always appends it and `marker = false` never does --
+# a standing decision, so write it yourself rather than letting an agent.
+
+[contacts]
+"""
+
+
+def _valid_contact_name(name: str) -> bool:
+    """A TOML bare key, so the file we write back is still parseable."""
+    return bool(name) and all(c.isalnum() or c in "_-" for c in name)
+
+
+def format_contact_line(name: str, contact: Contact) -> str:
+    """One TOML line for a contact.
+
+    A contact with no standing decision keeps the plain form it has always
+    had, so turning the feature on for one person does not rewrite the shape
+    of everyone else's entry.
+    """
+    if contact.marker is None:
+        return f'{name} = "{contact.identifier}"'
+    flag = "true" if contact.marker else "false"
+    return f'{name} = {{ id = "{contact.identifier}", marker = {flag} }}'
+
+
+def _verified(text: str, name: str, contact: Contact, path: Path) -> str:
+    """Never hand back a config a person has to repair by hand.
+
+    The line editor below understands the shapes this tool writes. A file
+    someone wrote themselves can hold others -- a `[contacts.name]` subtable
+    reads fine but is invisible to a scan of the `[contacts]` table, so
+    inserting a line there would define the same contact twice and every later
+    command would fail on a file nobody knowingly broke. Parsing the result
+    first turns that into a refusal.
+    """
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            f"that edit would leave {path} unparseable ({exc}); it is unchanged"
+        ) from exc
+    written = {k: _parse_contact(k, v) for k, v in data.get("contacts", {}).items()}
+    if written.get(name) != contact:
+        raise ConfigError(
+            f"could not set {name!r} in {path}; it is unchanged -- edit the file by hand"
+        )
+    return text
+
+
+def write_contact(name: str, contact: Contact, path: Path | None = None) -> Path:
+    """Insert or replace one contact, leaving the rest of the file alone.
+
+    Rewriting the file from parsed data would drop the comments a person put in
+    their own config, so this edits only the line that changes.
+    """
+    if not _valid_contact_name(name):
+        raise ConfigError(
+            f"contact name {name!r} must be letters, digits, dashes or underscores"
+        )
+    identifier = contact.identifier.strip()
+    if not identifier:
+        raise ConfigError("a contact needs an identifier")
+    if any(c in identifier for c in '"\\\n\r'):
+        raise ConfigError(f"identifier {identifier!r} contains a character that cannot be written")
+    contact = Contact(identifier, contact.marker)
+
+    if path is None:
+        path = contacts_path()
+    line = format_contact_line(name, contact)
+
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            _verified(CONTACTS_HEADER + line + "\n", name, contact, path), encoding="utf-8"
+        )
+        return path
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next((i for i, l in enumerate(lines) if l.strip() == "[contacts]"), None)
+    if start is None:
+        body = "\n".join(lines).rstrip("\n")
+        prefix = body + "\n\n" if body else ""
+        path.write_text(
+            _verified(f"{prefix}[contacts]\n{line}\n", name, contact, path), encoding="utf-8"
+        )
+        return path
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            end = i
+            break
+
+    for i in range(start + 1, end):
+        # Only the key half, so a commented-out entry is never mistaken for one.
+        if lines[i].split("=", 1)[0].strip() == name:
+            lines[i] = line
+            break
+    else:
+        insert = end
+        while insert > start + 1 and not lines[insert - 1].strip():
+            insert -= 1
+        lines.insert(insert, line)
+
+    path.write_text(
+        _verified("\n".join(lines) + "\n", name, contact, path), encoding="utf-8"
+    )
+    return path
 
 
 def resolve_chat(
@@ -182,10 +386,19 @@ class Message:
     from_me: bool
     text: str | None
     has_attachment: bool
+    sender: str | None = None
 
     def render(self) -> str:
+        """One line of transcript.
+
+        `sender` is set only for group threads, where "them" would collapse a
+        dozen different people into one word and make the transcript quotable
+        but misattributable. A one-to-one thread keeps the original two-column
+        shape, which also keeps the other person's phone number out of the
+        output.
+        """
         stamp = (self.date or "")[:16].replace("T", " ")
-        who = "me " if self.from_me else "them"
+        who = "me " if self.from_me else (self.sender or "them")
         body = self.text or ""
         if self.has_attachment:
             body = (body + " [attachment]").strip()
@@ -193,13 +406,42 @@ class Message:
 
 
 QUERY = """
-select m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments
+select m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments, h.id
 from message m
 join chat_message_join cmj on cmj.message_id = m.ROWID
 join chat c on c.ROWID = cmj.chat_id
+left join handle h on h.ROWID = m.handle_id
 where c.chat_identifier = ?
 order by m.date desc
 limit ?
+"""
+
+# One row per chat, so a caller can tell a group from a one-to-one before
+# deciding how to render it or how to address a send. `guid` carries the
+# service prefix AppleScript needs to reach a group ("iMessage;+;chat123...").
+CHAT_SHAPE_QUERY = """
+select c.guid, count(j.handle_id)
+from chat c
+left join chat_handle_join j on j.chat_id = c.ROWID
+where c.chat_identifier = ?
+group by c.ROWID
+"""
+
+# Groups that a known handle is already in. Scoped to one participant on
+# purpose: this answers "which groups is this contact in", never "list every
+# conversation on the machine".
+FIND_GROUPS_QUERY = """
+select c.chat_identifier, c.display_name, count(j.handle_id) n
+from chat c
+join chat_handle_join j on j.chat_id = c.ROWID
+where c.ROWID in (
+    select chj.chat_id from chat_handle_join chj
+    join handle h on h.ROWID = chj.handle_id
+    where h.id = ?
+)
+group by c.ROWID
+having n > 1
+order by n desc
 """
 
 
@@ -222,25 +464,77 @@ def _connect(db_path: Path = DEFAULT_DB):
         conn.close()
 
 
+def mask_handle(handle: str) -> str:
+    """A handle a person can recognise without printing the whole thing.
+
+    Group transcripts have to say who spoke, but the point of `contacts.toml`
+    is that phone numbers stay out of transcripts and shell history. A
+    participant nobody has named gets enough to be told apart and no more.
+    """
+    handle = (handle or "").strip()
+    if not handle:
+        return "unknown"
+    if "@" in handle:
+        local, _, domain = handle.partition("@")
+        return f"{local[:2]}***@{domain}"
+    return f"*{handle[-4:]}" if len(handle) > 4 else handle
+
+
+def chat_shape(chat_id: str, db_path: Path = DEFAULT_DB) -> tuple[str | None, int]:
+    """The chat's guid and participant count, for one identifier.
+
+    Answers two questions with one lookup: is this a group (count > 1), and
+    what does AppleScript need to address it (the guid, which carries the
+    service prefix). Returns (None, 0) for an identifier with no chat row.
+    """
+    if not chat_id:
+        raise ScopeError("chat_id is required")
+    with _connect(db_path) as conn:
+        row = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+    return (row[0], row[1]) if row else (None, 0)
+
+
+def find_groups(handle: str, db_path: Path = DEFAULT_DB) -> list[tuple[str, str | None, int]]:
+    """Group chats that one known handle is in, as (identifier, name, size).
+
+    Deliberately takes a participant rather than listing everything: a group
+    identifier cannot be guessed, so something has to hand it to you, but that
+    something should not be a dump of every conversation on the machine.
+    """
+    if not handle:
+        raise ScopeError("a participant is required")
+    with _connect(db_path) as conn:
+        return [tuple(r) for r in conn.execute(FIND_GROUPS_QUERY, (handle,)).fetchall()]
+
+
 def read_thread(
     chat_id: str,
     limit: int = 50,
     db_path: Path = DEFAULT_DB,
     include_empty: bool = False,
+    labels: dict[str, str] | None = None,
 ) -> list[Message]:
     """Read the most recent messages for one chat identifier, newest first.
 
     `chat_id` is required and is always bound as a parameter -- there is no
     code path that reads across threads.
+
+    Senders are attached only when the thread has more than one participant.
+    `labels` maps a handle to a name you already use for them, so a group
+    transcript reads in contact names rather than phone numbers.
     """
     if not chat_id:
         raise ScopeError("chat_id is required")
 
     with _connect(db_path) as conn:
         rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
+        shape = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+
+    is_group = bool(shape and shape[1] > 1)
+    labels = labels or {}
 
     out: list[Message] = []
-    for raw_date, is_from_me, text, blob, has_attachment in rows:
+    for raw_date, is_from_me, text, blob, has_attachment, handle in rows:
         body = text if text else decode_attributed_body(blob)
         if not include_empty and not (body and body.strip()) and not has_attachment:
             continue
@@ -251,6 +545,11 @@ def read_thread(
                 from_me=bool(is_from_me),
                 text=body,
                 has_attachment=bool(has_attachment),
+                sender=(
+                    labels.get(handle) or mask_handle(handle)
+                    if is_group and not is_from_me
+                    else None
+                ),
             )
         )
     return out
@@ -291,12 +590,32 @@ launch application "Messages"
 tell application "Messages" to send t to participant (item 2 of argv) of (first account whose service type is iMessage)
 end run"""
 
+# `chat id` takes the guid, which already carries the service prefix
+# ("iMessage;+;chat123...", "any;-;+1555..."). That prefix is why this is the
+# path for every chat that has a row, group or not: `participant ... of (first
+# account whose service type is iMessage)` can only ever reach iMessage, so on
+# an SMS or RCS thread it writes the message locally and never delivers it.
+# `launch` rather than `activate` for the same reason as above -- sending must
+# never steal focus.
+CHAT_SEND_SCRIPT = """on run argv
+set t to (read (POSIX file (item 1 of argv)) as \u00abclass utf8\u00bb)
+launch application "Messages"
+tell application "Messages" to send t to chat id (item 2 of argv)
+end run"""
 
-def send_message(chat: str | None, text: str, *, robot: bool) -> None:
+
+def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None = None) -> None:
     """Send one iMessage to one chat identifier.
 
     Scoped the same way reads are: no identifier, no send. There is no
     broadcast path and no "reply to whoever was last" convenience.
+
+    `guid` addresses an existing chat, group or one-to-one, and is used
+    whenever there is one: it carries that thread's own service, so an SMS or
+    RCS conversation is not silently addressed over iMessage. It is passed in
+    rather than looked up here so that sending still never touches chat.db.
+    Without a guid this addresses a single participant over iMessage, which is
+    correct only for a first message to someone with no chat row yet.
 
     The body goes via a UTF-8 file rather than inline in the AppleScript.
     Inline quoting mangles apostrophes and emoji, and the agent marker is an
@@ -305,6 +624,8 @@ def send_message(chat: str | None, text: str, *, robot: bool) -> None:
     identifier = (chat or "").strip()
     if not identifier:
         raise ScopeError("a chat identifier is required to send")
+
+    script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
 
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
@@ -316,7 +637,7 @@ def send_message(chat: str | None, text: str, *, robot: bool) -> None:
 
     try:
         result = subprocess.run(
-            ["osascript", "-e", SEND_SCRIPT, body_path, identifier],
+            ["osascript", "-e", script, body_path, target],
             capture_output=True,
             text=True,
         )
@@ -341,8 +662,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-empty", action="store_true", help="keep rows with no body")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to chat.db")
     p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
+    p.add_argument("--find-groups", action="store_true",
+                   help="list group chats that --contact/--chat is a member of")
     p.add_argument("--contacts-file", type=Path, default=None,
                    help=f"path to contacts.toml (default: ${CONTACTS_ENV}, then {CONFIG_CONTACTS})")
+    p.add_argument("--config", action="store_true",
+                   help="edit contacts.toml interactively (requires a terminal)")
     p.add_argument("--send", action="store_true", help="send a message instead of reading")
     body = p.add_mutually_exclusive_group()
     body.add_argument("--message", help="message body (prefer --message-file for anything with quotes or emoji)")
@@ -356,14 +681,26 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _resolve_marker_choice(robot: bool | None) -> bool | None:
+def _resolve_marker_choice(
+    robot: bool | None,
+    configured: bool | None = None,
+) -> bool | None:
     """Decide whether to mark, asking a human but never guessing for a program.
 
-    A non-interactive caller that says nothing gets refused rather than
-    defaulted. Silence from an agent is not consent to send unmarked.
+    Most specific wins: an explicit --robot/--no-robot, then the contact's
+    standing decision from contacts.toml, then a human at a terminal, and
+    otherwise a refusal.
+
+    Silence from an agent is still not consent to send unmarked -- that is what
+    the last branch is for. A configured value is not silence: it is a decision
+    a person made about this contact ahead of time, which is why it may answer
+    for a program when nothing else can. That only holds while a person is the
+    one who wrote it, so `--config` refuses to run without a terminal.
     """
     if robot is not None:
         return robot
+    if configured is not None:
+        return configured
     if not sys.stdin.isatty():
         print(
             "error: pass --robot or --no-robot when not running interactively",
@@ -374,6 +711,132 @@ def _resolve_marker_choice(robot: bool | None) -> bool | None:
     return answer not in {"n", "no"}
 
 
+CONFIG_COMMANDS = """commands:
+  list                         contacts and their marker setting
+  add NAME IDENTIFIER          add a contact, or point an existing one elsewhere
+  set NAME marker WORD         standing agent-marker decision: always, never, ask
+  quit"""
+
+
+def _print_config(path: Path, entries: dict[str, Contact]) -> None:
+    print(f"contacts.toml: {path}")
+    if not entries:
+        print("  (none configured)")
+        return
+    width = max(len(name) for name in entries)
+    for name, contact in sorted(entries.items()):
+        print(f"  {name:<{width}}  {contact.identifier}  marker: {marker_word(contact.marker)}")
+
+
+def _run_config(args: argparse.Namespace) -> int:
+    """Edit contacts.toml, but only for a person sitting at a terminal.
+
+    A contact's marker setting is allowed to answer for a program that passed
+    no flag, which is only sound while a person is the one who put it there.
+    Refusing without a tty is what makes that true: an agent cannot give itself
+    permission to send unmarked, because it cannot reach this code at all.
+    """
+    if not sys.stdin.isatty():
+        print(
+            "error: config changes must be made by a human at a terminal",
+            file=sys.stderr,
+        )
+        return 1
+
+    path = args.contacts_file or contacts_path()
+    try:
+        entries = load_contact_entries(path)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    _print_config(path, entries)
+    print()
+    print(CONFIG_COMMANDS)
+
+    while True:
+        try:
+            parts = input("> ").strip().split()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not parts:
+            continue
+        cmd, rest = parts[0].lower(), parts[1:]
+
+        if cmd in {"quit", "exit", "q"}:
+            return 0
+        if cmd in {"help", "?"}:
+            print(CONFIG_COMMANDS)
+            continue
+
+        try:
+            if cmd == "list":
+                entries = load_contact_entries(path)
+                _print_config(path, entries)
+            elif cmd == "add":
+                if len(rest) != 2:
+                    print("usage: add NAME IDENTIFIER")
+                    continue
+                name, identifier = rest
+                existing = entries.get(name)
+                # Repointing someone at a new number is not a reason to forget
+                # the marker decision already made about them.
+                keep = existing.marker if existing else None
+                write_contact(name, Contact(identifier, keep), path)
+                entries = load_contact_entries(path)
+                print(f"{name} -> {identifier}  marker: {marker_word(keep)}")
+            elif cmd == "set":
+                if len(rest) != 3 or rest[1].lower() != "marker":
+                    print("usage: set NAME marker always|never|ask")
+                    continue
+                name, word = rest[0], rest[2].lower()
+                if name not in entries:
+                    print(f"unknown contact {name!r} -- add it first")
+                    continue
+                if word not in MARKER_WORDS:
+                    print(f"marker must be one of: {', '.join(MARKER_WORDS)}")
+                    continue
+                write_contact(name, Contact(entries[name].identifier, MARKER_WORDS[word]), path)
+                entries = load_contact_entries(path)
+                print(f"{name} marker: {word}")
+            else:
+                print(f"unknown command {cmd!r}")
+                print(CONFIG_COMMANDS)
+        except (ConfigError, OSError) as exc:
+            print(f"error: {exc}")
+
+
+def _sender_labels(contacts_file: Path | None) -> dict[str, str]:
+    """handle -> the name you already use for them, for group transcripts."""
+    try:
+        return {c.identifier: name for name, c in load_contact_entries(contacts_file).items()}
+    except ConfigError:
+        return {}
+
+
+def _run_find_groups(args: argparse.Namespace) -> int:
+    """Groups one known participant is in.
+
+    Requires a participant for the same reason every other path does: there is
+    no mode that enumerates the whole machine.
+    """
+    try:
+        handle = resolve_chat(args.chat, args.contact, args.contacts_file)
+        groups = find_groups(handle, args.db)
+    except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not groups:
+        print("no group chats found for that participant", file=sys.stderr)
+        return 0
+
+    for identifier, name, size in groups:
+        print(f"{identifier}\t{size} participants\t{name or ''}".rstrip())
+    return 0
+
+
 def _run_send(args: argparse.Namespace) -> int:
     if args.message is None and args.message_file is None:
         print("error: --send needs --message or --message-file", file=sys.stderr)
@@ -381,21 +844,33 @@ def _run_send(args: argparse.Namespace) -> int:
 
     try:
         chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
+        configured = contact_marker(args.contact, args.contacts_file)
         text = (
             args.message_file.read_text(encoding="utf-8")
             if args.message_file is not None
             else args.message
         )
-    except (ScopeError, FileNotFoundError) as exc:
+        # A chat with no row yet is a first message to that person, not a
+        # group: participants is 0 and the one-to-one path is correct.
+        guid, participants = chat_shape(chat_id, args.db)
+    except (ScopeError, ConfigError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    robot = _resolve_marker_choice(args.robot)
+    if participants > 1 and not guid:
+        print(
+            f"error: {chat_id} is a group chat with no addressable id; "
+            "refusing to fall back to a single participant",
+            file=sys.stderr,
+        )
+        return 1
+
+    robot = _resolve_marker_choice(args.robot, configured)
     if robot is None:
         return 1
 
     try:
-        send_message(chat_id, text, robot=robot)
+        send_message(chat_id, text, robot=robot, guid=guid)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -407,9 +882,16 @@ def _run_send(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.config:
+        return _run_config(args)
+
     if args.contacts:
-        contacts = load_contacts(args.contacts_file)
-        if not contacts:
+        try:
+            entries = load_contact_entries(args.contacts_file)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if not entries:
             searched = "\n  ".join(str(c) for c in contacts_candidates())
             print(
                 f"no contacts configured -- create {args.contacts_file or CONFIG_CONTACTS}\n"
@@ -417,9 +899,15 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        for name, ident in sorted(contacts.items()):
-            print(f"{name}\t{ident}")
+        for name, contact in sorted(entries.items()):
+            # Only shown when set, so a contact with no standing decision reads
+            # exactly as it did before settings existed.
+            suffix = "" if contact.marker is None else f"\tmarker={marker_word(contact.marker)}"
+            print(f"{name}\t{contact.identifier}{suffix}")
         return 0
+
+    if args.find_groups:
+        return _run_find_groups(args)
 
     if args.send:
         return _run_send(args)
@@ -431,8 +919,9 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             db_path=args.db,
             include_empty=args.include_empty,
+            labels=_sender_labels(args.contacts_file),
         )
-    except (ScopeError, FileNotFoundError, PermissionError) as exc:
+    except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
