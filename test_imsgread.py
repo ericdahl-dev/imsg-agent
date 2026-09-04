@@ -358,8 +358,8 @@ def test_a_one_to_one_send_still_goes_to_a_participant(monkeypatch):
 def test_the_group_script_never_brings_messages_to_the_front():
     """Same requirement as the 1:1 script, pinned separately so a new script
     cannot quietly reintroduce focus stealing."""
-    assert "activate" not in imsgread.GROUP_SEND_SCRIPT
-    assert "launch" in imsgread.GROUP_SEND_SCRIPT
+    assert "activate" not in imsgread.CHAT_SEND_SCRIPT
+    assert "launch" in imsgread.CHAT_SEND_SCRIPT
 
 
 def test_a_group_with_no_guid_is_refused_rather_than_guessed(tmp_path, monkeypatch, capsys, db):
@@ -819,3 +819,40 @@ def test_a_group_send_honours_the_alias_marker(tmp_path, monkeypatch, db):
     assert code == 0
     assert seen["robot"] is True            # no flag passed; the alias decided
     assert seen["guid"] == "iMessage;+;chat9001"
+
+
+def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, monkeypatch):
+    """A green thread is only reachable through its own guid. The participant
+    path is pinned to the iMessage account, so addressing an SMS or RCS chat
+    that way writes the message into the thread and never delivers it."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: ("any;-;+1555", 1))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] == "any;-;+1555"
+
+
+def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch):
+    """Nobody has a chat row before the first message. That is the one case
+    where addressing a participant directly is the only option."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: (None, 0))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] is None

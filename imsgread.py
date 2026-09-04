@@ -590,11 +590,14 @@ launch application "Messages"
 tell application "Messages" to send t to participant (item 2 of argv) of (first account whose service type is iMessage)
 end run"""
 
-# A group is not addressable as a participant: `participant` resolves a single
-# handle. `chat id` takes the guid, which already carries the service prefix
-# ("iMessage;+;chat123..."). `launch` rather than `activate` for the same
-# reason as above -- sending must never steal focus.
-GROUP_SEND_SCRIPT = """on run argv
+# `chat id` takes the guid, which already carries the service prefix
+# ("iMessage;+;chat123...", "any;-;+1555..."). That prefix is why this is the
+# path for every chat that has a row, group or not: `participant ... of (first
+# account whose service type is iMessage)` can only ever reach iMessage, so on
+# an SMS or RCS thread it writes the message locally and never delivers it.
+# `launch` rather than `activate` for the same reason as above -- sending must
+# never steal focus.
+CHAT_SEND_SCRIPT = """on run argv
 set t to (read (POSIX file (item 1 of argv)) as \u00abclass utf8\u00bb)
 launch application "Messages"
 tell application "Messages" to send t to chat id (item 2 of argv)
@@ -607,9 +610,12 @@ def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None =
     Scoped the same way reads are: no identifier, no send. There is no
     broadcast path and no "reply to whoever was last" convenience.
 
-    `guid` addresses a group. It is passed in rather than looked up here so
-    that sending still never touches chat.db, and so a caller cannot reach a
-    group by accident: without a guid this only ever addresses one participant.
+    `guid` addresses an existing chat, group or one-to-one, and is used
+    whenever there is one: it carries that thread's own service, so an SMS or
+    RCS conversation is not silently addressed over iMessage. It is passed in
+    rather than looked up here so that sending still never touches chat.db.
+    Without a guid this addresses a single participant over iMessage, which is
+    correct only for a first message to someone with no chat row yet.
 
     The body goes via a UTF-8 file rather than inline in the AppleScript.
     Inline quoting mangles apostrophes and emoji, and the agent marker is an
@@ -619,7 +625,7 @@ def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None =
     if not identifier:
         raise ScopeError("a chat identifier is required to send")
 
-    script, target = (GROUP_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
+    script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
 
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
@@ -864,8 +870,7 @@ def _run_send(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        send_message(chat_id, text, robot=robot,
-                     guid=guid if participants > 1 else None)
+        send_message(chat_id, text, robot=robot, guid=guid)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
