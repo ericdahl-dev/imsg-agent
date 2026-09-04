@@ -18,6 +18,10 @@ The commands below call the installed `imsg-agent` executable, so they work from
 - Prefer `--contact CONTACT_NAME` from `contacts.toml` so phone numbers stay out of shell history, CI logs, and agent transcripts. `CONTACT_NAME` is a configured contact alias, not a literal name to copy.
 - Never read across all chats. This tool has no unscoped mode; do not try to bypass that with SQL.
 - Never send to “the last conversation” or any inferred recipient. Resolve the target explicitly.
+- An attachment cannot carry the marker. A file has no body to append 🤖 to, so
+  `--file` sends it unmarked even under `--robot`; only an accompanying message is
+  marked. Send a file on its own only when the recipient knowing an agent chose it
+  does not matter, and pair it with a marked line when it does.
 - The marker reflects whose words they are, not who typed them. For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
 - Use `--no-robot` only for words a human wrote or approved as their own, and only when they approved that specific message. Drafting in someone's voice and having them say "send it" is theirs; composing on their behalf unreviewed is yours.
 - A contact may carry a standing decision in `contacts.toml` (`marker = true` always marks, `marker = false` never does), which answers when no flag is passed. Where there is no such setting, omitting the choice in a non-interactive run is still refused -- an agent must not be able to send unmarked by default.
@@ -72,6 +76,51 @@ answers when no flag is given. Only the user can change it, at a terminal:
 ```bash
 imsg-agent --config
 ```
+
+## Group chats
+
+A group identifier cannot be guessed. Ask which groups a contact is already in:
+
+```bash
+imsg-agent --find-groups --contact CONTACT_NAME
+```
+
+That prints one line per group -- identifier, size, and name where the group has
+one. There is deliberately no way to list every group on the machine; the answer
+is always scoped to one participant you already have configured.
+
+Read one the same way as any other thread, using the identifier it printed:
+
+```bash
+imsg-agent --chat chat123456789012345678 -n 30 --text
+```
+
+A group read attributes each message to its sender: a configured contact by name,
+anyone else by a masked handle like `*1387`. A one-to-one read is unchanged and
+still shows `them`, which is what keeps the other person's number out of the
+transcript. Add a group to `contacts.toml` like any other contact if you read it
+often -- a group alias carries one standing marker decision covering everyone in it.
+
+## Attachments
+
+Reads report what came with a message, not just that something did:
+
+```
+2026-08-27 22:05  them  [image/png 196.3 KB ~/Library/Messages/Attachments/70/00/.../Screenshot.png]
+```
+
+Messages prunes old files, so an attachment that is no longer on disk reports
+`missing` rather than failing. Link previews are not reported at all: they are
+payload files that cannot be opened or forwarded, and the link is already in the
+message text.
+
+Send a file with `--file`, on its own or with a message:
+
+```bash
+imsg-agent --send --contact CONTACT_NAME --file ~/Pictures/shot.png --robot
+```
+
+Read the marker rule above before sending a file: the file itself goes unmarked.
 
 ## Expected workflow
 
