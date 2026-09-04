@@ -25,6 +25,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
@@ -444,6 +445,32 @@ having n > 1
 order by n desc
 """
 
+# Delivery is asynchronous. osascript returns as soon as Messages accepts the
+# text, so a zero exit says the app took it, never that anyone received it --
+# an iMessage send to a green thread exits 0 and then fails with error 22.
+# The outcome lands on the message row afterwards, so reading the row back is
+# the only honest confirmation.
+LAST_SENT_ROWID_QUERY = """
+select max(m.ROWID)
+from message m
+join chat_message_join cmj on cmj.message_id = m.ROWID
+join chat ch on ch.ROWID = cmj.chat_id
+where ch.chat_identifier = ? and m.is_from_me = 1
+"""
+
+# Scoped like every other query here: one chat identifier, and only rows above
+# the floor recorded before the send, so this can never report on an older
+# message or on anybody else's thread.
+DELIVERY_QUERY = """
+select m.is_sent, m.is_delivered, m.error, m.service
+from message m
+join chat_message_join cmj on cmj.message_id = m.ROWID
+join chat ch on ch.ROWID = cmj.chat_id
+where ch.chat_identifier = ? and m.is_from_me = 1 and m.ROWID > ?
+order by m.ROWID desc
+limit 1
+"""
+
 
 @contextmanager
 def _connect(db_path: Path = DEFAULT_DB):
@@ -492,6 +519,85 @@ def chat_shape(chat_id: str, db_path: Path = DEFAULT_DB) -> tuple[str | None, in
     with _connect(db_path) as conn:
         row = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
     return (row[0], row[1]) if row else (None, 0)
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """What became of a message after Messages accepted it.
+
+    Three outcomes rather than two, because "not delivered" and "no receipt"
+    are different facts. A plain SMS often never sets is_delivered at all --
+    the carrier returns no receipt -- so reading a missing flag as failure
+    would cry wolf on every green thread that worked perfectly well.
+    """
+
+    status: str
+    service: str | None
+    error: int = 0
+
+    def render(self) -> str:
+        where = f" over {self.service}" if self.service else ""
+        if self.status == "delivered":
+            return f"delivered{where}"
+        if self.status == "failed":
+            return f"NOT delivered{where}: error {self.error}"
+        return f"no delivery receipt{where}"
+
+
+def last_sent_rowid(chat_id: str, db_path: Path = DEFAULT_DB) -> int | None:
+    """The newest outgoing row in this thread, recorded before sending.
+
+    This floor is what makes the confirmation unambiguous: anything above it
+    in this chat is the message we just wrote, not an older one that happens
+    to sit at the end of the thread. None means the floor could not be read,
+    which is reported as unconfirmed rather than guessed at.
+    """
+    if not chat_id:
+        raise ScopeError("chat_id is required")
+    try:
+        with _connect(db_path) as conn:
+            row = conn.execute(LAST_SENT_ROWID_QUERY, (chat_id,)).fetchone()
+    except (FileNotFoundError, PermissionError, sqlite3.Error):
+        return None
+    return row[0] if row and row[0] is not None else 0
+
+
+def confirm_delivery(
+    chat_id: str,
+    after_rowid: int | None,
+    db_path: Path = DEFAULT_DB,
+    *,
+    timeout: float = 10.0,
+    interval: float = 0.25,
+) -> Delivery:
+    """Watch the row this send produced until it settles or time runs out.
+
+    Sending still never resolves a target through chat.db: the identifier is
+    the caller's, exactly as before. This reads back only the row the send
+    just created, which is the one thing osascript cannot report. A failure
+    arrives on the row within a second or two; a receipt may never arrive at
+    all, which is why waiting is bounded and a timeout is not an error.
+    """
+    if after_rowid is None:
+        return Delivery("unconfirmed", None)
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    service = None
+    while True:
+        try:
+            with _connect(db_path) as conn:
+                row = conn.execute(DELIVERY_QUERY, (chat_id, after_rowid)).fetchone()
+        except (FileNotFoundError, PermissionError, sqlite3.Error):
+            return Delivery("unconfirmed", service)
+        if row is not None:
+            service = row["service"] or service
+            if row["error"]:
+                return Delivery("failed", service, row["error"])
+            if row["is_delivered"]:
+                return Delivery("delivered", service)
+        if time.monotonic() >= deadline:
+            return Delivery("unconfirmed", service)
+        time.sleep(interval)
 
 
 def find_groups(handle: str, db_path: Path = DEFAULT_DB) -> list[tuple[str, str | None, int]]:
@@ -661,6 +767,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--oldest-first", action="store_true", help="reverse to chronological order")
     p.add_argument("--include-empty", action="store_true", help="keep rows with no body")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to chat.db")
+    p.add_argument("--confirm-timeout", type=float, default=10.0, metavar="SECONDS",
+                   help="how long to wait for a delivery result after sending "
+                        "(0 checks once and does not wait)")
     p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
     p.add_argument("--find-groups", action="store_true",
                    help="list group chats that --contact/--chat is a member of")
@@ -869,13 +978,22 @@ def _run_send(args: argparse.Namespace) -> int:
     if robot is None:
         return 1
 
+    # Recorded before the send so the row read back afterwards is certainly
+    # the one this call produced.
+    floor = last_sent_rowid(chat_id, args.db)
+
     try:
         send_message(chat_id, text, robot=robot, guid=guid)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"sent to {chat_id}{' ' + AGENT_MARKER if robot else ''}", file=sys.stderr)
+    delivery = confirm_delivery(chat_id, floor, args.db, timeout=args.confirm_timeout)
+    marked = f"{chat_id}{' ' + AGENT_MARKER if robot else ''}"
+    if delivery.status == "failed":
+        print(f"error: sent to {marked} but {delivery.render()}", file=sys.stderr)
+        return 1
+    print(f"sent to {marked} ({delivery.render()})", file=sys.stderr)
     return 0
 
 
