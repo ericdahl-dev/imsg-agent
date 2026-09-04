@@ -333,6 +333,10 @@ def test_claude_skill_documents_safe_scoped_usage():
         # go unmarked even though an agent typed them
         "The marker reflects whose words they are, not who typed them.",
         "only for words a human wrote or approved as their own",
+        # the marker default is the one value allowed to answer for a program,
+        # so an agent writing it would be granting itself permission
+        "Never write that setting yourself.",
+        "refuses to run without a terminal",
         # granting Full Disk Access does not reach an already-running process
         "restart the session afterwards",
         # UTC output has been misread as local time
@@ -431,3 +435,234 @@ def test_send_script_never_brings_messages_to_the_front():
     this without a GUI, so the requirement is pinned on the script itself."""
     assert "activate" not in imsgread.SEND_SCRIPT
     assert "launch" in imsgread.SEND_SCRIPT
+
+
+# --- per-contact marker default ----------------------------------------------
+
+def write_toml(path: Path, body: str) -> Path:
+    """write_contacts only emits the plain form; these need the table form too."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def send_args(cfg: Path, *extra: str) -> list[str]:
+    return ["--send", "--contact", "eric", "--message", "hi",
+            "--contacts-file", str(cfg), *extra]
+
+
+def test_both_contact_forms_load_from_one_file(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\n'
+        'brian = "+1555"\n'
+        'eric = { id = "+1666", marker = false }\n'
+        'mom = { id = "+1777", marker = true }\n'
+    ))
+    entries = imsgread.load_contact_entries(cfg)
+
+    assert entries["brian"] == imsgread.Contact("+1555", None)
+    assert entries["eric"] == imsgread.Contact("+1666", False)
+    assert entries["mom"] == imsgread.Contact("+1777", True)
+    # the old contract is what every other caller still uses
+    assert imsgread.load_contacts(cfg) == {"brian": "+1555", "eric": "+1666", "mom": "+1777"}
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ('[contacts]\neric = { marker = false }\n', "no 'id'"),
+    ('[contacts]\neric = { id = "+1", marekr = false }\n', "unknown key"),
+    ('[contacts]\neric = { id = "+1", marker = "never" }\n', "non-boolean"),
+    ('[contacts]\neric = 12\n', "must be an identifier or a table"),
+])
+def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
+    """A silently ignored marker is the worst outcome: the caller believes a
+    standing decision is in force while every send does the opposite."""
+    cfg = write_toml(tmp_path / "c.toml", body)
+    with pytest.raises(imsgread.ConfigError) as exc:
+        imsgread.load_contact_entries(cfg)
+    assert fragment in str(exc.value)
+    assert "eric" in str(exc.value)
+
+
+@pytest.mark.parametrize("stored, expected", [("false", False), ("true", True)])
+def test_a_contact_default_answers_for_a_program(tmp_path, monkeypatch, stored, expected):
+    """The one behaviour change: silence now resolves to a decision a person
+    recorded, instead of being refused."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(chat=chat, robot=robot))
+
+    assert main(send_args(cfg)) == 0
+    assert seen == {"chat": "+1555", "robot": expected}
+
+
+@pytest.mark.parametrize("stored, flag, expected", [
+    ("false", "--robot", True),
+    ("true", "--no-robot", False),
+])
+def test_an_explicit_flag_beats_the_contact_default(tmp_path, monkeypatch, stored, flag, expected):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(robot=robot))
+
+    assert main(send_args(cfg, flag)) == 0
+    assert seen["robot"] is expected
+
+
+def test_a_contact_without_a_setting_still_refuses(tmp_path, monkeypatch, capsys):
+    """Unchanged behaviour for everyone who has not opted in."""
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+
+    assert main(send_args(cfg)) != 0
+    assert "--robot" in capsys.readouterr().err
+
+
+def test_a_raw_chat_identifier_ignores_any_contact_default(tmp_path, monkeypatch, capsys):
+    """--chat is not a contact, so there is nowhere a decision could have been
+    recorded -- even when the same number is configured."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+
+    assert main(["--send", "--chat", "+1555", "--message", "hi",
+                 "--contacts-file", str(cfg)]) != 0
+    assert "--robot" in capsys.readouterr().err
+
+
+def test_contacts_listing_shows_a_setting_only_when_set(tmp_path, capsys):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\nbrian = "+1555"\neric = { id = "+1666", marker = false }\n'
+    ))
+    assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
+
+    out = capsys.readouterr().out.splitlines()
+    assert out == ["brian\t+1555", "eric\t+1666\tmarker=never"]
+
+
+# --- writing the config ------------------------------------------------------
+
+def test_writing_a_contact_keeps_the_rest_of_the_file(tmp_path):
+    """Rewriting from parsed data would drop a person's own comments."""
+    cfg = write_toml(tmp_path / "c.toml", (
+        "# my header\n\n[contacts]\n# brian is my brother\n"
+        'brian = "+1555"\ndisco = "+1666"\n'
+    ))
+    imsgread.write_contact("brian", imsgread.Contact("+1555", True), cfg)
+    imsgread.write_contact("eric", imsgread.Contact("+1777", False), cfg)
+
+    text = cfg.read_text()
+    assert "# my header" in text
+    assert "# brian is my brother" in text
+    assert 'brian = { id = "+1555", marker = true }' in text
+    assert 'disco = "+1666"' in text
+    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1777", False)
+
+
+def test_clearing_a_setting_returns_the_plain_form(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    imsgread.write_contact("eric", imsgread.Contact("+1555", None), cfg)
+
+    assert 'eric = "+1555"' in cfg.read_text()
+
+
+def test_a_contact_that_would_break_the_file_is_refused(tmp_path):
+    cfg = write_toml(tmp_path / "c.toml", '[contacts]\n')
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("eric", imsgread.Contact('+1" , evil = "yes'), cfg)
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("not a name", imsgread.Contact("+1555"), cfg)
+
+
+def test_a_write_that_would_corrupt_the_file_is_refused(tmp_path):
+    """A [contacts.name] subtable reads fine but is invisible to a scan of the
+    [contacts] table, so a naive insert would define the contact twice."""
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\nbrian = "+1555"\n\n[contacts.eric]\nid = "+1666"\nmarker = false\n'
+    ))
+    before = cfg.read_text()
+
+    with pytest.raises(imsgread.ConfigError):
+        imsgread.write_contact("eric", imsgread.Contact("+1666", True), cfg)
+
+    assert cfg.read_text() == before
+    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1666", False)
+
+
+def test_config_mode_refuses_without_a_terminal(tmp_path, monkeypatch, capsys):
+    """The mitigation is enforced, not documented: an agent cannot reach the
+    code that would let it give itself a marker default."""
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+
+    assert main(["--config", "--contacts-file", str(cfg)]) != 0
+    assert "human at a terminal" in capsys.readouterr().err
+    assert imsgread.load_contact_entries(cfg)["eric"].marker is None
+
+
+@pytest.mark.parametrize("word, expected", [
+    ("never", False), ("always", True), ("ask", None),
+])
+def test_config_mode_records_a_decision(tmp_path, monkeypatch, word, expected):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    replies = iter([f"set eric marker {word}", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    assert imsgread.load_contact_entries(cfg)["eric"].marker is expected
+
+
+def test_config_mode_adds_a_contact_and_keeps_its_decision(tmp_path, monkeypatch):
+    """Repointing someone at a new number is not a reason to forget the
+    decision already made about them."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+    replies = iter(["add mom +1777", "add eric +1888", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    entries = imsgread.load_contact_entries(cfg)
+    assert entries["mom"] == imsgread.Contact("+1777", None)
+    assert entries["eric"] == imsgread.Contact("+1888", False)
+
+
+def test_config_mode_survives_a_bad_command(tmp_path, monkeypatch, capsys):
+    from imsgread import main
+
+    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    replies = iter(["nonsense", "set nobody marker never", "set eric marker sometimes", "quit"])
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    out = capsys.readouterr().out
+    assert "unknown command" in out
+    assert "unknown contact" in out
+    assert "marker must be one of" in out
