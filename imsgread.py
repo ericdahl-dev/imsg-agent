@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 import sys
 import tomllib
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
@@ -34,7 +35,17 @@ from pathlib import Path
 __version__ = "0.1.0"
 
 DEFAULT_DB = Path.home() / "Library" / "Messages" / "chat.db"
-CONTACTS_FILE = Path(__file__).with_name("contacts.toml")
+
+# contacts.toml is looked for in several places so the tool works the same
+# whether it was cloned or installed. Installing into site-packages leaves
+# nowhere sensible to keep a config file, and an upgrade would wipe it.
+CONTACTS_ENV = "IMSG_AGENT_CONTACTS"
+CONTACTS_FILENAME = "contacts.toml"
+CONFIG_CONTACTS = Path(
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+) / "imsg-agent" / CONTACTS_FILENAME
+# Alongside the module: the repo root for a clone or an editable install.
+BUNDLED_CONTACTS = Path(__file__).with_name(CONTACTS_FILENAME)
 
 # macOS stores message.date as nanoseconds since 2001-01-01 UTC (10.13+).
 # Much older rows use seconds. Anything past this bound is nanoseconds.
@@ -104,9 +115,36 @@ def apple_time(raw: int | None) -> datetime | None:
 # contacts
 # --------------------------------------------------------------------------
 
-def load_contacts(path: Path = CONTACTS_FILE) -> dict[str, str]:
-    """Map friendly names to chat identifiers, so callers pass `disco` rather
+def contacts_candidates() -> list[Path]:
+    """Every path searched for contacts.toml, in precedence order.
+
+    An explicit environment variable wins, then the user's config directory,
+    then a copy sitting next to the module -- which is the repo root for a
+    clone or an editable install, and how this tool behaved before it was
+    installable.
+    """
+    paths: list[Path] = []
+    env = os.environ.get(CONTACTS_ENV)
+    if env:
+        paths.append(Path(env).expanduser())
+    paths.append(CONFIG_CONTACTS)
+    paths.append(BUNDLED_CONTACTS)
+    return paths
+
+
+def contacts_path() -> Path:
+    """The contacts file in effect, or where to create one if none exists."""
+    for candidate in contacts_candidates():
+        if candidate.exists():
+            return candidate
+    return CONFIG_CONTACTS
+
+
+def load_contacts(path: Path | None = None) -> dict[str, str]:
+    """Map friendly names to chat identifiers, so callers pass `friend` rather
     than a phone number. Keeps raw numbers out of shell history and logs."""
+    if path is None:
+        path = contacts_path()
     if not path.exists():
         return {}
     with path.open("rb") as fh:
@@ -114,12 +152,16 @@ def load_contacts(path: Path = CONTACTS_FILE) -> dict[str, str]:
     return {k: str(v) for k, v in data.get("contacts", {}).items()}
 
 
-def resolve_chat(chat: str | None, contact: str | None) -> str:
+def resolve_chat(
+    chat: str | None,
+    contact: str | None,
+    contacts_file: Path | None = None,
+) -> str:
     """Return a chat identifier, or raise. There is deliberately no default."""
     if chat:
         return chat
     if contact:
-        contacts = load_contacts()
+        contacts = load_contacts(contacts_file)
         if contact not in contacts:
             known = ", ".join(sorted(contacts)) or "none configured"
             raise ScopeError(f"unknown contact {contact!r} (known: {known})")
@@ -161,6 +203,25 @@ limit ?
 """
 
 
+@contextmanager
+def _connect(db_path: Path = DEFAULT_DB):
+    """Open chat.db read-only. The database is never written by this tool."""
+    if not db_path.exists():
+        raise FileNotFoundError(f"no chat database at {db_path}")
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:  # pragma: no cover - env specific
+        raise PermissionError(
+            f"cannot open {db_path}: {exc}. Grant Full Disk Access to your "
+            "terminal in System Settings > Privacy & Security."
+        ) from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def read_thread(
     chat_id: str,
     limit: int = 50,
@@ -174,22 +235,9 @@ def read_thread(
     """
     if not chat_id:
         raise ScopeError("chat_id is required")
-    if not db_path.exists():
-        raise FileNotFoundError(f"no chat database at {db_path}")
 
-    uri = f"file:{db_path}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError as exc:  # pragma: no cover - env specific
-        raise PermissionError(
-            f"cannot open {db_path}: {exc}. Grant Full Disk Access to your "
-            "terminal in System Settings > Privacy & Security."
-        ) from exc
-
-    try:
+    with _connect(db_path) as conn:
         rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
-    finally:
-        conn.close()
 
     out: list[Message] = []
     for raw_date, is_from_me, text, blob, has_attachment in rows:
@@ -229,8 +277,12 @@ def mark_agent_sent(text: str, *, robot: bool) -> str:
     return f"{text.rstrip()} {AGENT_MARKER}"
 
 
+# `launch` rather than `activate`: it starts Messages in the background if it is
+# not already running. `activate`, and letting `tell` cold-start the app, pulls
+# Messages in front of whatever the user is doing.
 SEND_SCRIPT = """on run argv
 set t to (read (POSIX file (item 1 of argv)) as \u00abclass utf8\u00bb)
+launch application "Messages"
 tell application "Messages" to send t to participant (item 2 of argv) of (first account whose service type is iMessage)
 end run"""
 
@@ -277,13 +329,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     target = p.add_mutually_exclusive_group()
     target.add_argument("--chat", help="chat identifier, e.g. +15555550123")
-    target.add_argument("--contact", help="name from contacts.toml, e.g. disco")
+    target.add_argument("--contact", help="name from contacts.toml, e.g. friend")
     p.add_argument("-n", "--limit", type=int, default=50, help="messages to read (default 50)")
     p.add_argument("--text", action="store_true", help="human-readable output instead of JSON")
     p.add_argument("--oldest-first", action="store_true", help="reverse to chronological order")
     p.add_argument("--include-empty", action="store_true", help="keep rows with no body")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to chat.db")
     p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
+    p.add_argument("--contacts-file", type=Path, default=None,
+                   help=f"path to contacts.toml (default: ${CONTACTS_ENV}, then {CONFIG_CONTACTS})")
     p.add_argument("--send", action="store_true", help="send a message instead of reading")
     body = p.add_mutually_exclusive_group()
     body.add_argument("--message", help="message body (prefer --message-file for anything with quotes or emoji)")
@@ -321,7 +375,7 @@ def _run_send(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        chat_id = resolve_chat(args.chat, args.contact)
+        chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
         text = (
             args.message_file.read_text(encoding="utf-8")
             if args.message_file is not None
@@ -349,9 +403,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.contacts:
-        contacts = load_contacts()
+        contacts = load_contacts(args.contacts_file)
         if not contacts:
-            print(f"no contacts configured -- create {CONTACTS_FILE}", file=sys.stderr)
+            searched = "\n  ".join(str(c) for c in contacts_candidates())
+            print(
+                f"no contacts configured -- create {args.contacts_file or CONFIG_CONTACTS}\n"
+                f"searched:\n  {searched}",
+                file=sys.stderr,
+            )
             return 1
         for name, ident in sorted(contacts.items()):
             print(f"{name}\t{ident}")
@@ -361,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_send(args)
 
     try:
-        chat_id = resolve_chat(args.chat, args.contact)
+        chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
         messages = read_thread(
             chat_id,
             limit=args.limit,

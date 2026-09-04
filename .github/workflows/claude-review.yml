@@ -1,0 +1,57 @@
+name: claude review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Secrets are not available to pull requests from forks, and the action
+    # cannot authenticate without one. Skip rather than fail red.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. This tool reads and sends a person's
+            real iMessages, so weigh the invariants below above style.
+
+            Privacy and scoping, in priority order:
+            - No real phone numbers, email addresses, contact nicknames, or
+              message content in tracked files. Placeholders are `friend` and
+              `+15555550123`. Flag anything that looks like a real identifier,
+              including in tests, fixtures, and docs.
+            - Every read and send path must be scoped to one chat identifier.
+              There is deliberately no unscoped mode. Reject any code path
+              that could read or write across threads.
+            - `--robot` marks agent-authored messages. A non-interactive
+              caller that states no marker choice must be refused, never
+              defaulted. Silent unmarked sends are the failure to prevent.
+            - chat.db must be opened read-only.
+
+            Also check correctness of the typedstream decoder and the
+            contacts.toml lookup order, and whether README install steps still
+            match what a new user would actually run.
+
+            Note: the PR branch is already checked out.
+
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` (with
+            `confirmed: true`) for specific lines.
+            Only post GitHub comments - do not return review text as messages.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
