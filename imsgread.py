@@ -28,7 +28,7 @@ import sys
 import time
 import tomllib
 from contextlib import contextmanager
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -381,6 +381,37 @@ def resolve_chat(
 # reading
 # --------------------------------------------------------------------------
 
+def human_bytes(n: int | None) -> str:
+    """A size read at a glance rather than counted in digits."""
+    if not n:
+        return "0 B"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """One file that came with a message.
+
+    `path` is stored as chat.db stores it, "~"-prefixed. `exists` is checked
+    at read time because Messages prunes old files: roughly one in eight
+    recent attachments is already gone, which is normal rather than an error.
+    """
+    path: str
+    mime_type: str | None
+    total_bytes: int | None
+    exists: bool
+
+    def render(self) -> str:
+        kind = self.mime_type or "file"
+        size = "missing" if not self.exists else human_bytes(self.total_bytes)
+        return f"[{kind} {size} {self.path}]"
+
+
 @dataclass
 class Message:
     date: str | None
@@ -388,6 +419,7 @@ class Message:
     text: str | None
     has_attachment: bool
     sender: str | None = None
+    attachments: list[Attachment] = field(default_factory=list)
 
     def render(self) -> str:
         """One line of transcript.
@@ -401,13 +433,16 @@ class Message:
         stamp = (self.date or "")[:16].replace("T", " ")
         who = "me " if self.from_me else (self.sender or "them")
         body = self.text or ""
-        if self.has_attachment:
+        if self.attachments:
+            body = " ".join([body.strip(), *(a.render() for a in self.attachments)]).strip()
+        elif self.has_attachment:
+            # the join row is gone but the message still remembers there was one
             body = (body + " [attachment]").strip()
         return f"{stamp}  {who}  {body}"
 
 
 QUERY = """
-select m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments, h.id
+select m.ROWID, m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments, h.id
 from message m
 join chat_message_join cmj on cmj.message_id = m.ROWID
 join chat c on c.ROWID = cmj.chat_id
@@ -415,6 +450,22 @@ left join handle h on h.ROWID = m.handle_id
 where c.chat_identifier = ?
 order by m.date desc
 limit ?
+"""
+
+# Messages writes one of these per URL to back a link preview. They cannot be
+# opened or forwarded, the link itself is already in the message text, and
+# there are 10k+ of them here -- listing them buries the real files. None
+# carries a mime type, so nothing real is caught by the suffix.
+PREVIEW_SUFFIX = ".pluginPayloadAttachment"
+
+# Files for a set of messages. Kept as its own lookup rather than a join on
+# QUERY: a message can carry several attachments (7k+ of them here), and
+# joining would multiply the message rows instead of grouping under them.
+ATTACHMENT_QUERY = """
+select maj.message_id, a.filename, a.mime_type, a.total_bytes
+from message_attachment_join maj
+join attachment a on a.ROWID = maj.attachment_id
+where maj.message_id in ({placeholders})
 """
 
 # One row per chat, so a caller can tell a group from a one-to-one before
@@ -613,6 +664,26 @@ def find_groups(handle: str, db_path: Path = DEFAULT_DB) -> list[tuple[str, str 
         return [tuple(r) for r in conn.execute(FIND_GROUPS_QUERY, (handle,)).fetchall()]
 
 
+def _attachments_for(conn, message_ids: list[int]) -> dict[int, list[Attachment]]:
+    """Attachments grouped under the message they arrived with."""
+    if not message_ids:
+        return {}
+    query = ATTACHMENT_QUERY.format(placeholders=",".join("?" * len(message_ids)))
+    out: dict[int, list[Attachment]] = {}
+    for message_id, filename, mime, size in conn.execute(query, message_ids):
+        if not filename or filename.endswith(PREVIEW_SUFFIX):
+            continue
+        out.setdefault(message_id, []).append(
+            Attachment(
+                path=filename,
+                mime_type=mime,
+                total_bytes=size,
+                exists=Path(filename).expanduser().exists(),
+            )
+        )
+    return out
+
+
 def read_thread(
     chat_id: str,
     limit: int = 50,
@@ -635,12 +706,13 @@ def read_thread(
     with _connect(db_path) as conn:
         rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
         shape = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+        files = _attachments_for(conn, [r[0] for r in rows])
 
     is_group = bool(shape and shape[1] > 1)
     labels = labels or {}
 
     out: list[Message] = []
-    for raw_date, is_from_me, text, blob, has_attachment, handle in rows:
+    for rowid, raw_date, is_from_me, text, blob, has_attachment, handle in rows:
         body = text if text else decode_attributed_body(blob)
         if not include_empty and not (body and body.strip()) and not has_attachment:
             continue
@@ -650,7 +722,8 @@ def read_thread(
                 date=stamp.isoformat() if stamp else None,
                 from_me=bool(is_from_me),
                 text=body,
-                has_attachment=bool(has_attachment),
+                has_attachment=bool(has_attachment) or bool(files.get(rowid)),
+                attachments=files.get(rowid, []),
                 sender=(
                     labels.get(handle) or mask_handle(handle)
                     if is_group and not is_from_me
@@ -710,7 +783,44 @@ tell application "Messages" to send t to chat id (item 2 of argv)
 end run"""
 
 
-def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None = None) -> None:
+# Messages raises this when chat.db holds a row it will not address: a chat
+# with yourself, or a thread Messages has since pruned.
+UNADDRESSABLE_CHAT = "-1728"
+
+
+def _osascript(script: str, *args: str) -> None:
+    result = subprocess.run(
+        ["osascript", "-e", script, *args], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
+
+
+def _send_via(
+    script: str, fallback: str, payload: str, target: str, identifier: str
+) -> None:
+    """Run a send, and reroute it only when the chat itself is unreachable.
+
+    The participant path can only reach iMessage, which is why it is never the
+    default. But when the chat cannot be addressed at all, iMessage is the
+    difference between delivering and not. Any other AppleScript error is a
+    real failure and is raised rather than retried down a different route.
+    """
+    try:
+        _osascript(script, payload, target)
+    except RuntimeError as exc:
+        if script is fallback or UNADDRESSABLE_CHAT not in str(exc):
+            raise
+        _osascript(fallback, payload, identifier)
+
+
+def send_message(
+    chat: str | None,
+    text: str,
+    *,
+    robot: bool,
+    guid: str | None = None,
+) -> None:
     """Send one iMessage to one chat identifier.
 
     Scoped the same way reads are: no identifier, no send. There is no
@@ -742,13 +852,7 @@ def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None =
         body_path = handle.name
 
     try:
-        result = subprocess.run(
-            ["osascript", "-e", script, body_path, target],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
+        _send_via(script, SEND_SCRIPT, body_path, target, identifier)
     finally:
         os.unlink(body_path)
 
@@ -957,7 +1061,7 @@ def _run_send(args: argparse.Namespace) -> int:
         text = (
             args.message_file.read_text(encoding="utf-8")
             if args.message_file is not None
-            else args.message
+            else (args.message or "")
         )
         # A chat with no row yet is a first message to that person, not a
         # group: participants is 0 and the one-to-one path is correct.

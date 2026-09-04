@@ -142,8 +142,21 @@ def db(tmp_path: Path) -> Path:
         create table chat_message_join (chat_id integer, message_id integer);
         create table handle (ROWID integer primary key, id text);
         create table chat_handle_join (chat_id integer, handle_id integer);
+        create table attachment (ROWID integer primary key, filename text,
+                                 mime_type text, total_bytes integer);
+        create table message_attachment_join (message_id integer, attachment_id integer);
         """
     )
+    # one attachment that is still on disk, one that has been cleaned up
+    real = tmp_path / "pic.jpg"
+    real.write_bytes(b"x" * 2_202_010)
+    conn.execute("insert into attachment values (1, ?, 'image/jpeg', 2202010)", (str(real),))
+    conn.execute("insert into attachment values (2, '~/gone/old.png', 'image/png', 4096)")
+    # a link preview: Messages writes one per URL and they are never openable
+    conn.execute("insert into attachment values (3, '~/p/AB12.pluginPayloadAttachment', null, 2048)")
+    conn.execute("insert into message_attachment_join values (3, 1)")
+    conn.execute("insert into message_attachment_join values (3, 2)")
+    conn.execute("insert into message_attachment_join values (3, 3)")
     conn.execute("insert into chat values (1, '+15555550123', 'iMessage;-;+15555550123', null)")
     conn.execute("insert into chat values (2, '+15555559999', 'iMessage;-;+15555559999', null)")
     conn.execute("insert into chat values (3, 'chat9001', 'iMessage;+;chat9001', 'trail crew')")
@@ -250,6 +263,39 @@ def test_group_senders_use_a_known_name_and_mask_the_rest(db):
     assert "alice" in senders
     assert "*1111" in senders          # unnamed participant, masked
     assert "+15555551111" not in senders
+
+
+def test_an_attachment_reports_its_type_size_and_path(db):
+    """[attachment] says something arrived but not what. Type, size and path
+    are what make a transcript actionable."""
+    msgs = read_thread("+15555550123", db_path=db)
+    shot = next(m for m in msgs if m.has_attachment)
+    kept = next(a for a in shot.attachments if a.exists)
+
+    assert kept.mime_type == "image/jpeg"
+    assert kept.total_bytes == 2202010
+    rendered = shot.render()
+    assert "image/jpeg" in rendered
+    assert "2.1 MB" in rendered
+    assert kept.path in rendered
+
+
+def test_an_attachment_no_longer_on_disk_is_marked_missing(db):
+    """About one in eight recent attachments is already gone; a read must
+    treat that as normal rather than as an error."""
+    msgs = read_thread("+15555550123", db_path=db)
+    shot = next(m for m in msgs if m.has_attachment)
+    gone = next(a for a in shot.attachments if not a.exists)
+
+    assert gone.mime_type == "image/png"
+    assert "missing" in shot.render()
+
+
+def test_a_message_without_an_attachment_is_unchanged(db):
+    msgs = read_thread("+15555550123", db_path=db)
+    plain = next(m for m in msgs if m.text == "plain text column wins")
+    assert plain.attachments == []
+    assert plain.render().endswith("plain text column wins")
 
 
 # --- sending -----------------------------------------------------------------
@@ -991,3 +1037,54 @@ def test_a_send_without_a_receipt_still_succeeds(tmp_path, monkeypatch, capsys):
 
     assert main(send_args(cfg)) == 0
     assert "no delivery receipt over SMS" in capsys.readouterr().err
+
+
+def test_link_previews_are_not_reported_as_attachments(db):
+    """Messages writes a pluginPayloadAttachment per URL. They cannot be
+    opened or forwarded and the link is already in the message text, so
+    listing them buries the real files under path noise."""
+    msgs = read_thread("+15555550123", db_path=db)
+    shot = next(m for m in msgs if m.has_attachment)
+
+    assert len(shot.attachments) == 2
+    assert "pluginPayload" not in shot.render()
+
+
+def test_an_unaddressable_chat_falls_back_to_the_participant(monkeypatch):
+    """chat.db keeps rows Messages will not address -- a chat with yourself,
+    or a thread Messages has pruned -- and they fail with -1728. Reaching the
+    person over iMessage beats not delivering at all."""
+    from imsgread import send_message
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(" ".join(str(c) for c in cmd))
+        class R:
+            returncode = 0 if len(calls) > 1 else 1
+            stderr = "" if len(calls) > 1 else 'Can\u2019t get chat id "any;-;+1555". (-1728)'
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("+15555550123", "hi", robot=False, guid="any;-;+15555550123")
+
+    assert len(calls) == 2, calls
+    assert "chat id" in calls[0]
+    assert "participant" in calls[1]
+    assert "+15555550123" in calls[1]
+
+
+def test_a_real_applescript_failure_still_raises(monkeypatch):
+    """Only -1728 is a routing problem. Everything else is a real error and
+    must not be retried into a different delivery path."""
+    from imsgread import send_message
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stderr = "Messages got an error: something else (-1712)"
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError):
+        send_message("+15555550123", "hi", robot=False, guid="any;-;+15555550123")

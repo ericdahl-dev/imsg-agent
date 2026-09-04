@@ -155,6 +155,7 @@ this repo, so they work from whatever directory the agent happens to be in.
 --db PATH            alternate chat.db
 --contacts           list configured contacts and exit
 --contacts-file PATH alternate contacts.toml for this run
+--find-groups        list group chats --contact/--chat is a member of
 
 --send               send instead of reading
 --message TEXT       message body
@@ -174,13 +175,53 @@ JSON output, newest first:
     "date": "2026-08-19T04:15:09.239040+00:00",
     "from_me": false,
     "text": "yea XF is good",
-    "has_attachment": false
+    "has_attachment": false,
+    "sender": null,
+    "attachments": []
   }
 ]
 ```
 
 `has_attachment` is worth reading. A message can carry an image and no text at
 all, which for a thread where someone sends scans is signal, not noise.
+`attachments` carries the detail -- type, size, and path per file -- with
+`exists` false once Messages has pruned the file from disk. Link previews are
+excluded: they are payload files nothing can open, and the link is already in
+the text.
+
+`sender` is set only on group threads, where a bare "them" would collapse every
+participant into one word. It resolves to a contact name where you have one and
+a masked handle otherwise. One-to-one reads leave it null, which is what keeps
+the other person's number out of the output.
+
+## Group chats
+
+Group identifiers cannot be guessed, so ask which groups a contact is in:
+
+```
+$ imsg-agent --find-groups --contact brian
+chat41566504093568607	8 participants	Dudes Abide
+chat606231711236685994	6 participants
+```
+
+There is no way to list every group on the machine. The answer is always scoped
+to one participant, for the same reason no read is ever unscoped.
+
+Then read or send with the identifier it prints. A group can go in
+`contacts.toml` like any other contact, and carries one standing marker decision
+for everyone in it.
+
+## Attachments
+
+```
+$ imsg-agent --contact friend -n 5 --text
+2026-08-27 22:05  them  [image/png 196.3 KB ~/Library/Messages/Attachments/70/00/.../Screenshot.png]
+```
+
+Reading only. Sending a file through AppleScript (`send <file> to
+participant`) writes the bubble into the thread locally and never delivers it
+-- chat.db records error 25 while osascript exits 0 -- so the tool does not
+offer it rather than reporting a success that did not happen.
 
 Or as a module, if you have a clone but no install: `python3 imsgread.py
 --contact friend -n 20 --text`.

@@ -73,6 +73,48 @@ answers when no flag is given. Only the user can change it, at a terminal:
 imsg-agent --config
 ```
 
+## Group chats
+
+A group identifier cannot be guessed. Ask which groups a contact is already in:
+
+```bash
+imsg-agent --find-groups --contact CONTACT_NAME
+```
+
+That prints one line per group -- identifier, size, and name where the group has
+one. There is deliberately no way to list every group on the machine; the answer
+is always scoped to one participant you already have configured.
+
+Read one the same way as any other thread, using the identifier it printed:
+
+```bash
+imsg-agent --chat chat123456789012345678 -n 30 --text
+```
+
+A group read attributes each message to its sender: a configured contact by name,
+anyone else by a masked handle like `*1387`. A one-to-one read is unchanged and
+still shows `them`, which is what keeps the other person's number out of the
+transcript. Add a group to `contacts.toml` like any other contact if you read it
+often -- a group alias carries one standing marker decision covering everyone in it.
+
+## Attachments
+
+Reads report what came with a message, not just that something did:
+
+```
+2026-08-27 22:05  them  [image/png 196.3 KB ~/Library/Messages/Attachments/70/00/.../Screenshot.png]
+```
+
+Messages prunes old files, so an attachment that is no longer on disk reports
+`missing` rather than failing. Link previews are not reported at all: they are
+payload files that cannot be opened or forwarded, and the link is already in the
+message text.
+
+Attachments can only be read, not sent. `send <file> to participant` through
+AppleScript writes the bubble locally and fails to deliver (error 25 in
+chat.db) while osascript still exits 0, so there is deliberately no flag for
+it. Send an image by hand in Messages.
+
 ## Expected workflow
 
 1. Identify the exact contact or chat identifier from the user’s request or `contacts.toml`.
