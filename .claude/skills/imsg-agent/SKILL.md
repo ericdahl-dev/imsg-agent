@@ -15,10 +15,11 @@ Use this skill when you need to read or send iMessages from Claude Code on a Mac
 - Prefer `--contact CONTACT_NAME` from `contacts.toml` so phone numbers stay out of shell history, CI logs, and agent transcripts. `CONTACT_NAME` is a configured contact alias, not a literal name to copy.
 - Never read across all chats. This tool has no unscoped mode; do not try to bypass that with SQL.
 - Never send to “the last conversation” or any inferred recipient. Resolve the target explicitly.
-- For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
-- If a human explicitly asks for an unmarked send, use `--no-robot`; do not omit the marker choice in non-interactive runs.
+- The marker reflects whose words they are, not who typed them. For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
+- Use `--no-robot` only for words a human wrote or approved as their own, and only when they approved that specific message. Drafting in someone's voice and having them say "send it" is theirs; composing on their behalf unreviewed is yours. Never omit the marker choice in non-interactive runs — an agent must not be able to send unmarked by default.
 - Prefer `--message-file` for anything longer than a short plain-text message, or anything with quotes, apostrophes, newlines, or emoji.
-- If reading fails on macOS, check Full Disk Access for the terminal before changing code.
+- If reading fails on macOS, check Full Disk Access for the terminal before changing code. Granting it does not reach a process that is already running: restart the session afterwards, or every read still fails.
+- Timestamps are printed in UTC. `16:44` is `12:44` US Eastern — do not read a message as hours newer than it is.
 
 ## Common commands
 
@@ -75,4 +76,4 @@ osascript -e 'tell application "Messages" to send "hi" to buddy "+155****0123"'
 python3 imsgread.py --send --contact CONTACT_NAME --message 'it works'
 ```
 
-The first command is unscoped, the second leaks a phone number into command history, and the third is unsafe for non-interactive agents because it does not state whether the message should be marked.
+The first is unscoped: it reads across every conversation on the machine. The second leaks a phone number into command history. The third puts the body through shell quoting, where apostrophes and emoji are mangled and the text lands in history — and it leaves the marker unstated, so it is unsafe for a non-interactive agent on two counts.
