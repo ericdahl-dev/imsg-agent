@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+REPO_ROOT = Path(__file__).parent
+
 import imsgread
 from imsgread import (
     Message,
@@ -293,5 +295,34 @@ def test_interactive_send_asks_before_marking(monkeypatch):
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot: seen.update(robot=robot))
 
-    assert main(["--send", "--chat", "+15555550123", "--message", "hi"]) == 0
+    assert main(["--send", "--chat", "+155****0123", "--message", "hi"]) == 0
     assert seen["robot"] is False
+
+
+# --- Claude skill ------------------------------------------------------------
+
+def test_claude_skill_documents_safe_scoped_usage():
+    skill = REPO_ROOT / ".claude" / "skills" / "imsg-agent" / "SKILL.md"
+    body = skill.read_text(encoding="utf-8")
+
+    required = [
+        "name: imsg-agent",
+        "Always scope every read or send to one `--contact` or one `--chat` identifier.",
+        "Prefer `--contact CONTACT_NAME` from `contacts.toml`",
+        "`CONTACT_NAME` is a configured contact alias, not a literal name to copy.",
+        "Do not query `~/Library/Messages/chat.db` directly",
+        "use `--robot` so the outgoing message is marked with 🤖",
+        # the marker is about authorship, not mechanism: a human's approved words
+        # go unmarked even though an agent typed them
+        "The marker reflects whose words they are, not who typed them.",
+        "only for words a human wrote or approved as their own",
+        # granting Full Disk Access does not reach an already-running process
+        "restart the session afterwards",
+        # UTC output has been misread as local time
+        "Timestamps are printed in UTC.",
+        "Prefer `--message-file`",
+        "python3 imsgread.py --contact CONTACT_NAME -n 20 --text",
+        "python3 imsgread.py --send --contact CONTACT_NAME --message-file reply.txt --robot",
+    ]
+    for text in required:
+        assert text in body
