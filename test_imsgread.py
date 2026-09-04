@@ -369,7 +369,7 @@ def test_a_group_with_no_guid_is_refused_rather_than_guessed(tmp_path, monkeypat
 
     monkeypatch.setattr("imsgread.send_message",
                         lambda *a, **k: pytest.fail("must not send"))
-    code = main(["--send", "--chat", "chat9002", "--message", "hi",
+    code = main(["--send", "--chat", "chat9002", "--message", "hi", "--confirm-timeout", "0",
                  "--robot", "--db", str(db)])
 
     assert code != 0
@@ -383,7 +383,7 @@ def test_non_interactive_send_must_state_the_marker_choice(monkeypatch, capsys):
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
 
-    code = main(["--send", "--chat", "+15555550123", "--message", "hi"])
+    code = main(["--send", "--chat", "+15555550123", "--message", "hi", "--confirm-timeout", "0"])
 
     assert code != 0
     assert "--robot" in capsys.readouterr().err
@@ -397,7 +397,7 @@ def test_non_interactive_send_proceeds_when_told(monkeypatch):
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot, **kw: seen.update(chat=chat, text=text, robot=robot, **kw))
 
-    assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--robot"]) == 0
+    assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--robot", "--confirm-timeout", "0"]) == 0
     assert (seen["chat"], seen["text"], seen["robot"]) == ("+15555550123", "hi", True)
 
 
@@ -410,7 +410,7 @@ def test_interactive_send_asks_before_marking(monkeypatch):
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot, **kw: seen.update(robot=robot, **kw))
 
-    assert main(["--send", "--chat", "+155****0123", "--message", "hi"]) == 0
+    assert main(["--send", "--chat", "+155****0123", "--message", "hi", "--confirm-timeout", "0"]) == 0
     assert seen["robot"] is False
 
 
@@ -529,7 +529,7 @@ def test_resolve_chat_honours_contacts_file_from_cli(tmp_path, monkeypatch, caps
 
     assert imsgread.main([
         "--send", "--contact", "friend", "--message", "hi", "--robot",
-        "--contacts-file", str(explicit),
+        "--contacts-file", str(explicit), "--confirm-timeout", "0",
     ]) == 0
     assert seen["chat"] == "+1888"
 
@@ -552,8 +552,10 @@ def write_toml(path: Path, body: str) -> Path:
 
 
 def send_args(cfg: Path, *extra: str) -> list[str]:
+    # --confirm-timeout 0: send_message is stubbed in these tests, so no row
+    # ever appears to confirm. Waiting for one would only buy dead seconds.
     return ["--send", "--contact", "eric", "--message", "hi",
-            "--contacts-file", str(cfg), *extra]
+            "--contacts-file", str(cfg), "--confirm-timeout", "0", *extra]
 
 
 def test_both_contact_forms_load_from_one_file(tmp_path):
@@ -645,7 +647,7 @@ def test_a_raw_chat_identifier_ignores_any_contact_default(tmp_path, monkeypatch
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
 
-    assert main(["--send", "--chat", "+1555", "--message", "hi",
+    assert main(["--send", "--chat", "+1555", "--message", "hi", "--confirm-timeout", "0",
                  "--contacts-file", str(cfg)]) != 0
     assert "--robot" in capsys.readouterr().err
 
@@ -813,7 +815,7 @@ def test_a_group_send_honours_the_alias_marker(tmp_path, monkeypatch, db):
                         lambda chat, text, **k: seen.update(chat=chat, **k))
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
-    code = main(["--send", "--contact", "crew", "--message", "hi",
+    code = main(["--send", "--contact", "crew", "--message", "hi", "--confirm-timeout", "0",
                  "--contacts-file", str(cfg), "--db", str(db)])
 
     assert code == 0
@@ -856,3 +858,136 @@ def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch):
 
     assert main(send_args(cfg)) == 0
     assert seen["guid"] is None
+
+
+# --------------------------------------------------------------------------
+# delivery confirmation
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def delivery_db(tmp_path: Path) -> Path:
+    path = tmp_path / "delivery.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        create table message (ROWID integer primary key, is_from_me integer,
+                              is_sent integer, is_delivered integer,
+                              error integer, service text);
+        create table chat (ROWID integer primary key, chat_identifier text);
+        create table chat_message_join (chat_id integer, message_id integer);
+        """
+    )
+    conn.execute("insert into chat values (1, '+15555550123')")
+    conn.execute("insert into chat values (2, '+15555559999')")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def add_sent(path: Path, rowid: int, chat: int, *, delivered=0, error=0, service="iMessage"):
+    conn = sqlite3.connect(path)
+    conn.execute("insert into message values (?,1,1,?,?,?)",
+                 (rowid, delivered, error, service))
+    conn.execute("insert into chat_message_join values (?,?)", (chat, rowid))
+    conn.commit()
+    conn.close()
+
+
+def test_a_delivered_message_is_reported_as_delivered(delivery_db):
+    add_sent(delivery_db, 10, 1, delivered=1)
+
+    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+
+    assert result.status == "delivered"
+    assert result.render() == "delivered over iMessage"
+
+
+def test_an_undelivered_message_reports_the_error_code(delivery_db):
+    """The failure this path exists for: Messages accepted the text, osascript
+    exited 0, and the send failed afterwards with error 22."""
+    add_sent(delivery_db, 10, 1, error=22)
+
+    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+
+    assert result.status == "failed"
+    assert result.error == 22
+    assert result.render() == "NOT delivered over iMessage: error 22"
+
+
+def test_a_missing_receipt_is_not_called_a_failure(delivery_db):
+    """Plain SMS returns no receipt at all. Reading a missing flag as failure
+    would cry wolf on every green thread that worked perfectly well."""
+    add_sent(delivery_db, 10, 1, delivered=0, service="SMS")
+
+    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+
+    assert result.status == "unconfirmed"
+    assert result.render() == "no delivery receipt over SMS"
+
+
+def test_confirmation_ignores_anything_older_than_the_send(delivery_db):
+    """The floor is what makes this the message we just sent rather than
+    whatever already sat at the end of the thread."""
+    add_sent(delivery_db, 10, 1, error=22)
+
+    result = imsgread.confirm_delivery("+15555550123", 10, delivery_db, timeout=0)
+
+    assert result.status == "unconfirmed"
+
+
+def test_confirmation_never_reads_another_thread(delivery_db):
+    """Scoped like every other query here: a failure in someone else's thread
+    is not this send's failure."""
+    add_sent(delivery_db, 10, 2, error=22)
+
+    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+
+    assert result.status == "unconfirmed"
+
+
+def test_the_floor_is_the_newest_outgoing_row(delivery_db):
+    add_sent(delivery_db, 10, 1)
+    add_sent(delivery_db, 11, 1)
+
+    assert imsgread.last_sent_rowid("+15555550123", delivery_db) == 11
+    assert imsgread.last_sent_rowid("+15555559999", delivery_db) == 0
+
+
+def test_an_unreadable_database_is_unconfirmed_rather_than_delivered(tmp_path):
+    """Losing Full Disk Access must not turn into a false confirmation."""
+    assert imsgread.last_sent_rowid("+15555550123", tmp_path / "missing.db") is None
+    assert imsgread.confirm_delivery("+15555550123", None,
+                                     tmp_path / "missing.db", timeout=0).status == "unconfirmed"
+
+
+def test_a_failed_delivery_makes_the_command_fail(tmp_path, monkeypatch, capsys):
+    """A send that never arrived must not exit 0. That was the bug."""
+    from imsgread import main, Delivery
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+    monkeypatch.setattr("imsgread.last_sent_rowid", lambda *a, **k: 0)
+    monkeypatch.setattr("imsgread.confirm_delivery",
+                        lambda *a, **k: Delivery("failed", "iMessage", 22))
+
+    assert main(send_args(cfg)) == 1
+    assert "NOT delivered over iMessage: error 22" in capsys.readouterr().err
+
+
+def test_a_send_without_a_receipt_still_succeeds(tmp_path, monkeypatch, capsys):
+    """Green threads routinely deliver without a receipt. The command says so
+    rather than failing or claiming more than it knows."""
+    from imsgread import main, Delivery
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
+    monkeypatch.setattr("imsgread.last_sent_rowid", lambda *a, **k: 0)
+    monkeypatch.setattr("imsgread.confirm_delivery",
+                        lambda *a, **k: Delivery("unconfirmed", "SMS"))
+
+    assert main(send_args(cfg)) == 0
+    assert "no delivery receipt over SMS" in capsys.readouterr().err
