@@ -135,26 +135,41 @@ def db(tmp_path: Path) -> Path:
     conn.executescript(
         """
         create table message (ROWID integer primary key, date integer, is_from_me integer,
-                              text text, attributedBody blob, cache_has_attachments integer);
-        create table chat (ROWID integer primary key, chat_identifier text);
+                              text text, attributedBody blob, cache_has_attachments integer,
+                              handle_id integer);
+        create table chat (ROWID integer primary key, chat_identifier text, guid text,
+                           display_name text);
         create table chat_message_join (chat_id integer, message_id integer);
+        create table handle (ROWID integer primary key, id text);
+        create table chat_handle_join (chat_id integer, handle_id integer);
         """
     )
-    conn.execute("insert into chat values (1, '+15555550123')")
-    conn.execute("insert into chat values (2, '+15555559999')")
+    conn.execute("insert into chat values (1, '+15555550123', 'iMessage;-;+15555550123', null)")
+    conn.execute("insert into chat values (2, '+15555559999', 'iMessage;-;+15555559999', null)")
+    conn.execute("insert into chat values (3, 'chat9001', 'iMessage;+;chat9001', 'trail crew')")
+    conn.execute("insert into chat values (4, 'chat9002', null, 'no guid')")
+    for rowid, ident in ((1, "+15555550123"), (2, "+15555559999"), (3, "+15555551111")):
+        conn.execute("insert into handle values (?,?)", (rowid, ident))
+    # one-to-one chats have a single participant; the group has three
+    for chat, handle in ((1, 1), (2, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 2)):
+        conn.execute("insert into chat_handle_join values (?,?)", (chat, handle))
 
-    def add(rowid, chat, date, from_me, text, blob, attach=0):
+    def add(rowid, chat, date, from_me, text, blob, attach=0, handle_id=None):
         conn.execute(
-            "insert into message values (?,?,?,?,?,?)", (rowid, date, from_me, text, blob, attach)
+            "insert into message values (?,?,?,?,?,?,?)",
+            (rowid, date, from_me, text, blob, attach, handle_id),
         )
         conn.execute("insert into chat_message_join values (?,?)", (chat, rowid))
 
     base = 700_000_000 * 10**9
-    add(1, 1, base + 1, 0, None, make_blob("first from them"))
+    add(1, 1, base + 1, 0, None, make_blob("first from them"), handle_id=1)
     add(2, 1, base + 2, 1, "plain text column wins", None)
-    add(3, 1, base + 3, 0, None, None, attach=1)          # attachment only
-    add(4, 1, base + 4, 0, None, None)                    # empty, should drop
-    add(5, 2, base + 5, 0, None, make_blob("OTHER THREAD"))
+    add(3, 1, base + 3, 0, None, None, attach=1, handle_id=1)   # attachment only
+    add(4, 1, base + 4, 0, None, None, handle_id=1)             # empty, should drop
+    add(5, 2, base + 5, 0, None, make_blob("OTHER THREAD"), handle_id=2)
+    add(6, 3, base + 6, 0, "from alice", None, handle_id=1)
+    add(7, 3, base + 7, 0, "from carol", None, handle_id=3)
+    add(8, 3, base + 8, 1, "from me", None)
     conn.commit()
     conn.close()
     return path
@@ -207,6 +222,34 @@ def test_missing_database_raises(tmp_path):
 def test_render_is_readable():
     m = Message(date="2026-08-19T14:30:00+00:00", from_me=False, text="hi", has_attachment=True)
     assert m.render() == "2026-08-19 14:30  them  hi [attachment]"
+
+
+def test_a_group_thread_attributes_each_sender(db):
+    """Collapsing a group into one word makes the transcript quotable but
+    misattributable, which is worse than not reading it at all."""
+    msgs = read_thread("chat9001", db_path=db)
+    said = {m.sender: m.text for m in msgs if not m.from_me}
+    assert len(said) == 2, said
+    assert set(said.values()) == {"from alice", "from carol"}
+    assert all(m.sender is None for m in msgs if m.from_me)
+
+
+def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
+    """The whole point of contacts.toml is that numbers stay out of output."""
+    msgs = read_thread("+15555550123", db_path=db)
+    assert all(m.sender is None for m in msgs)
+    rendered = "\n".join(m.render() for m in msgs)
+    assert "+15555550123" not in rendered
+    assert "them" in rendered
+
+
+def test_group_senders_use_a_known_name_and_mask_the_rest(db):
+    msgs = read_thread("chat9001", db_path=db,
+                       labels={"+15555550123": "alice"})
+    senders = {m.sender for m in msgs if not m.from_me}
+    assert "alice" in senders
+    assert "*1111" in senders          # unnamed participant, masked
+    assert "+15555551111" not in senders
 
 
 # --- sending -----------------------------------------------------------------
@@ -269,6 +312,68 @@ def test_send_passes_the_marked_text_to_applescript(monkeypatch, tmp_path):
 
     assert seen["body"] == "Photos are fixed 🤖"
     assert "+15555550123" in " ".join(seen["cmd"])
+
+
+def test_a_group_send_addresses_the_chat_not_a_participant(monkeypatch):
+    """`participant` resolves one handle. A group has to be addressed by its
+    guid, which carries the service prefix."""
+    from imsgread import send_message
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = " ".join(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("chat9001", "trail is open", robot=True, guid="iMessage;+;chat9001")
+
+    assert "iMessage;+;chat9001" in seen["cmd"]
+    assert "chat id" in seen["cmd"]
+
+
+def test_a_one_to_one_send_still_goes_to_a_participant(monkeypatch):
+    """Regression guard: adding the group branch must not reroute 1:1 sends."""
+    from imsgread import send_message
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = " ".join(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr("imsgread.subprocess.run", fake_run)
+    send_message("+15555550123", "hi", robot=False)
+
+    assert "participant" in seen["cmd"]
+    assert "chat id" not in seen["cmd"]
+
+
+def test_the_group_script_never_brings_messages_to_the_front():
+    """Same requirement as the 1:1 script, pinned separately so a new script
+    cannot quietly reintroduce focus stealing."""
+    assert "activate" not in imsgread.CHAT_SEND_SCRIPT
+    assert "launch" in imsgread.CHAT_SEND_SCRIPT
+
+
+def test_a_group_with_no_guid_is_refused_rather_than_guessed(tmp_path, monkeypatch, capsys, db):
+    """No guid means the group cannot be addressed. Falling back to
+    `participant` would send to one member instead of the group."""
+    from imsgread import main
+
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda *a, **k: pytest.fail("must not send"))
+    code = main(["--send", "--chat", "chat9002", "--message", "hi",
+                 "--robot", "--db", str(db)])
+
+    assert code != 0
+    assert "group" in capsys.readouterr().err.lower()
 
 
 def test_non_interactive_send_must_state_the_marker_choice(monkeypatch, capsys):
@@ -666,3 +771,88 @@ def test_config_mode_survives_a_bad_command(tmp_path, monkeypatch, capsys):
     assert "unknown command" in out
     assert "unknown contact" in out
     assert "marker must be one of" in out
+
+
+# --- finding groups ----------------------------------------------------------
+
+def test_find_groups_lists_only_groups_the_contact_is_in(tmp_path, capsys, db):
+    """A group id cannot be guessed, so something has to hand it over -- but
+    scoped to one participant, never a dump of every conversation."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\nalice = "+15555550123"\n')
+    code = main(["--find-groups", "--contact", "alice",
+                 "--contacts-file", str(cfg), "--db", str(db)])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "chat9001" in out
+    assert "trail crew" in out
+    assert "+15555559999" not in out       # the 1:1 chat is not a group
+    assert "+15555550123" not in out       # and no numbers in the listing
+
+
+def test_find_groups_refuses_without_a_participant(capsys, db):
+    """No participant would mean enumerating every group on the machine."""
+    from imsgread import main
+
+    assert main(["--find-groups", "--db", str(db)]) != 0
+    assert "error" in capsys.readouterr().err.lower()
+
+
+def test_a_group_send_honours_the_alias_marker(tmp_path, monkeypatch, db):
+    """Per the decision recorded for this tool: a group alias carries one
+    marker setting, exactly like a one-to-one contact."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\ncrew = { id = "chat9001", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, **k: seen.update(chat=chat, **k))
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+
+    code = main(["--send", "--contact", "crew", "--message", "hi",
+                 "--contacts-file", str(cfg), "--db", str(db)])
+
+    assert code == 0
+    assert seen["robot"] is True            # no flag passed; the alias decided
+    assert seen["guid"] == "iMessage;+;chat9001"
+
+
+def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, monkeypatch):
+    """A green thread is only reachable through its own guid. The participant
+    path is pinned to the iMessage account, so addressing an SMS or RCS chat
+    that way writes the message into the thread and never delivers it."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: ("any;-;+1555", 1))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] == "any;-;+1555"
+
+
+def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch):
+    """Nobody has a chat row before the first message. That is the one case
+    where addressing a participant directly is the only option."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+    seen = {}
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("imsgread.chat_shape",
+                        lambda chat_id, db_path=None: (None, 0))
+    monkeypatch.setattr("imsgread.send_message",
+                        lambda chat, text, robot, **kw: seen.update(kw))
+
+    assert main(send_args(cfg)) == 0
+    assert seen["guid"] is None

@@ -386,10 +386,19 @@ class Message:
     from_me: bool
     text: str | None
     has_attachment: bool
+    sender: str | None = None
 
     def render(self) -> str:
+        """One line of transcript.
+
+        `sender` is set only for group threads, where "them" would collapse a
+        dozen different people into one word and make the transcript quotable
+        but misattributable. A one-to-one thread keeps the original two-column
+        shape, which also keeps the other person's phone number out of the
+        output.
+        """
         stamp = (self.date or "")[:16].replace("T", " ")
-        who = "me " if self.from_me else "them"
+        who = "me " if self.from_me else (self.sender or "them")
         body = self.text or ""
         if self.has_attachment:
             body = (body + " [attachment]").strip()
@@ -397,13 +406,42 @@ class Message:
 
 
 QUERY = """
-select m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments
+select m.date, m.is_from_me, m.text, m.attributedBody, m.cache_has_attachments, h.id
 from message m
 join chat_message_join cmj on cmj.message_id = m.ROWID
 join chat c on c.ROWID = cmj.chat_id
+left join handle h on h.ROWID = m.handle_id
 where c.chat_identifier = ?
 order by m.date desc
 limit ?
+"""
+
+# One row per chat, so a caller can tell a group from a one-to-one before
+# deciding how to render it or how to address a send. `guid` carries the
+# service prefix AppleScript needs to reach a group ("iMessage;+;chat123...").
+CHAT_SHAPE_QUERY = """
+select c.guid, count(j.handle_id)
+from chat c
+left join chat_handle_join j on j.chat_id = c.ROWID
+where c.chat_identifier = ?
+group by c.ROWID
+"""
+
+# Groups that a known handle is already in. Scoped to one participant on
+# purpose: this answers "which groups is this contact in", never "list every
+# conversation on the machine".
+FIND_GROUPS_QUERY = """
+select c.chat_identifier, c.display_name, count(j.handle_id) n
+from chat c
+join chat_handle_join j on j.chat_id = c.ROWID
+where c.ROWID in (
+    select chj.chat_id from chat_handle_join chj
+    join handle h on h.ROWID = chj.handle_id
+    where h.id = ?
+)
+group by c.ROWID
+having n > 1
+order by n desc
 """
 
 
@@ -426,25 +464,77 @@ def _connect(db_path: Path = DEFAULT_DB):
         conn.close()
 
 
+def mask_handle(handle: str) -> str:
+    """A handle a person can recognise without printing the whole thing.
+
+    Group transcripts have to say who spoke, but the point of `contacts.toml`
+    is that phone numbers stay out of transcripts and shell history. A
+    participant nobody has named gets enough to be told apart and no more.
+    """
+    handle = (handle or "").strip()
+    if not handle:
+        return "unknown"
+    if "@" in handle:
+        local, _, domain = handle.partition("@")
+        return f"{local[:2]}***@{domain}"
+    return f"*{handle[-4:]}" if len(handle) > 4 else handle
+
+
+def chat_shape(chat_id: str, db_path: Path = DEFAULT_DB) -> tuple[str | None, int]:
+    """The chat's guid and participant count, for one identifier.
+
+    Answers two questions with one lookup: is this a group (count > 1), and
+    what does AppleScript need to address it (the guid, which carries the
+    service prefix). Returns (None, 0) for an identifier with no chat row.
+    """
+    if not chat_id:
+        raise ScopeError("chat_id is required")
+    with _connect(db_path) as conn:
+        row = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+    return (row[0], row[1]) if row else (None, 0)
+
+
+def find_groups(handle: str, db_path: Path = DEFAULT_DB) -> list[tuple[str, str | None, int]]:
+    """Group chats that one known handle is in, as (identifier, name, size).
+
+    Deliberately takes a participant rather than listing everything: a group
+    identifier cannot be guessed, so something has to hand it to you, but that
+    something should not be a dump of every conversation on the machine.
+    """
+    if not handle:
+        raise ScopeError("a participant is required")
+    with _connect(db_path) as conn:
+        return [tuple(r) for r in conn.execute(FIND_GROUPS_QUERY, (handle,)).fetchall()]
+
+
 def read_thread(
     chat_id: str,
     limit: int = 50,
     db_path: Path = DEFAULT_DB,
     include_empty: bool = False,
+    labels: dict[str, str] | None = None,
 ) -> list[Message]:
     """Read the most recent messages for one chat identifier, newest first.
 
     `chat_id` is required and is always bound as a parameter -- there is no
     code path that reads across threads.
+
+    Senders are attached only when the thread has more than one participant.
+    `labels` maps a handle to a name you already use for them, so a group
+    transcript reads in contact names rather than phone numbers.
     """
     if not chat_id:
         raise ScopeError("chat_id is required")
 
     with _connect(db_path) as conn:
         rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
+        shape = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+
+    is_group = bool(shape and shape[1] > 1)
+    labels = labels or {}
 
     out: list[Message] = []
-    for raw_date, is_from_me, text, blob, has_attachment in rows:
+    for raw_date, is_from_me, text, blob, has_attachment, handle in rows:
         body = text if text else decode_attributed_body(blob)
         if not include_empty and not (body and body.strip()) and not has_attachment:
             continue
@@ -455,6 +545,11 @@ def read_thread(
                 from_me=bool(is_from_me),
                 text=body,
                 has_attachment=bool(has_attachment),
+                sender=(
+                    labels.get(handle) or mask_handle(handle)
+                    if is_group and not is_from_me
+                    else None
+                ),
             )
         )
     return out
@@ -495,12 +590,32 @@ launch application "Messages"
 tell application "Messages" to send t to participant (item 2 of argv) of (first account whose service type is iMessage)
 end run"""
 
+# `chat id` takes the guid, which already carries the service prefix
+# ("iMessage;+;chat123...", "any;-;+1555..."). That prefix is why this is the
+# path for every chat that has a row, group or not: `participant ... of (first
+# account whose service type is iMessage)` can only ever reach iMessage, so on
+# an SMS or RCS thread it writes the message locally and never delivers it.
+# `launch` rather than `activate` for the same reason as above -- sending must
+# never steal focus.
+CHAT_SEND_SCRIPT = """on run argv
+set t to (read (POSIX file (item 1 of argv)) as \u00abclass utf8\u00bb)
+launch application "Messages"
+tell application "Messages" to send t to chat id (item 2 of argv)
+end run"""
 
-def send_message(chat: str | None, text: str, *, robot: bool) -> None:
+
+def send_message(chat: str | None, text: str, *, robot: bool, guid: str | None = None) -> None:
     """Send one iMessage to one chat identifier.
 
     Scoped the same way reads are: no identifier, no send. There is no
     broadcast path and no "reply to whoever was last" convenience.
+
+    `guid` addresses an existing chat, group or one-to-one, and is used
+    whenever there is one: it carries that thread's own service, so an SMS or
+    RCS conversation is not silently addressed over iMessage. It is passed in
+    rather than looked up here so that sending still never touches chat.db.
+    Without a guid this addresses a single participant over iMessage, which is
+    correct only for a first message to someone with no chat row yet.
 
     The body goes via a UTF-8 file rather than inline in the AppleScript.
     Inline quoting mangles apostrophes and emoji, and the agent marker is an
@@ -509,6 +624,8 @@ def send_message(chat: str | None, text: str, *, robot: bool) -> None:
     identifier = (chat or "").strip()
     if not identifier:
         raise ScopeError("a chat identifier is required to send")
+
+    script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
 
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
@@ -520,7 +637,7 @@ def send_message(chat: str | None, text: str, *, robot: bool) -> None:
 
     try:
         result = subprocess.run(
-            ["osascript", "-e", SEND_SCRIPT, body_path, identifier],
+            ["osascript", "-e", script, body_path, target],
             capture_output=True,
             text=True,
         )
@@ -545,6 +662,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-empty", action="store_true", help="keep rows with no body")
     p.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to chat.db")
     p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
+    p.add_argument("--find-groups", action="store_true",
+                   help="list group chats that --contact/--chat is a member of")
     p.add_argument("--contacts-file", type=Path, default=None,
                    help=f"path to contacts.toml (default: ${CONTACTS_ENV}, then {CONFIG_CONTACTS})")
     p.add_argument("--config", action="store_true",
@@ -688,6 +807,36 @@ def _run_config(args: argparse.Namespace) -> int:
             print(f"error: {exc}")
 
 
+def _sender_labels(contacts_file: Path | None) -> dict[str, str]:
+    """handle -> the name you already use for them, for group transcripts."""
+    try:
+        return {c.identifier: name for name, c in load_contact_entries(contacts_file).items()}
+    except ConfigError:
+        return {}
+
+
+def _run_find_groups(args: argparse.Namespace) -> int:
+    """Groups one known participant is in.
+
+    Requires a participant for the same reason every other path does: there is
+    no mode that enumerates the whole machine.
+    """
+    try:
+        handle = resolve_chat(args.chat, args.contact, args.contacts_file)
+        groups = find_groups(handle, args.db)
+    except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not groups:
+        print("no group chats found for that participant", file=sys.stderr)
+        return 0
+
+    for identifier, name, size in groups:
+        print(f"{identifier}\t{size} participants\t{name or ''}".rstrip())
+    return 0
+
+
 def _run_send(args: argparse.Namespace) -> int:
     if args.message is None and args.message_file is None:
         print("error: --send needs --message or --message-file", file=sys.stderr)
@@ -701,8 +850,19 @@ def _run_send(args: argparse.Namespace) -> int:
             if args.message_file is not None
             else args.message
         )
+        # A chat with no row yet is a first message to that person, not a
+        # group: participants is 0 and the one-to-one path is correct.
+        guid, participants = chat_shape(chat_id, args.db)
     except (ScopeError, ConfigError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if participants > 1 and not guid:
+        print(
+            f"error: {chat_id} is a group chat with no addressable id; "
+            "refusing to fall back to a single participant",
+            file=sys.stderr,
+        )
         return 1
 
     robot = _resolve_marker_choice(args.robot, configured)
@@ -710,7 +870,7 @@ def _run_send(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        send_message(chat_id, text, robot=robot)
+        send_message(chat_id, text, robot=robot, guid=guid)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -746,6 +906,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name}\t{contact.identifier}{suffix}")
         return 0
 
+    if args.find_groups:
+        return _run_find_groups(args)
+
     if args.send:
         return _run_send(args)
 
@@ -756,6 +919,7 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             db_path=args.db,
             include_empty=args.include_empty,
+            labels=_sender_labels(args.contacts_file),
         )
     except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
