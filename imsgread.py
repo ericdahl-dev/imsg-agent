@@ -156,7 +156,7 @@ class Contact:
 
     `marker` records a standing decision about the agent marker for this
     person: True always marks, False never does, and None means no decision
-    was recorded, which is the behaviour this tool has always had -- ask a
+    was recorded, which is the behavior this tool has always had -- ask a
     human, refuse a program.
     """
 
@@ -543,7 +543,7 @@ def _connect(db_path: Path = DEFAULT_DB):
 
 
 def mask_handle(handle: str) -> str:
-    """A handle a person can recognise without printing the whole thing.
+    """A handle a person can recognize without printing the whole thing.
 
     Group transcripts have to say who spoke, but the point of `contacts.toml`
     is that phone numbers stay out of transcripts and shell history. A

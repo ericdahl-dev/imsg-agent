@@ -567,7 +567,7 @@ def test_contacts_file_flag_overrides_every_default(tmp_path, monkeypatch):
     assert imsgread.resolve_chat(None, "friend", explicit) == "+1888"
 
 
-def test_resolve_chat_honours_contacts_file_from_cli(tmp_path, monkeypatch, capsys):
+def test_resolve_chat_honors_contacts_file_from_cli(tmp_path, monkeypatch, capsys):
     explicit = write_contacts(tmp_path / "explicit.toml", "friend", "+1888")
     seen = {}
     monkeypatch.setattr(imsgread, "send_message",
@@ -638,7 +638,7 @@ def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
 
 @pytest.mark.parametrize("stored, expected", [("false", False), ("true", True)])
 def test_a_contact_default_answers_for_a_program(tmp_path, monkeypatch, stored, expected):
-    """The one behaviour change: silence now resolves to a decision a person
+    """The one behavior change: silence now resolves to a decision a person
     recorded, instead of being refused."""
     from imsgread import main
 
@@ -672,7 +672,7 @@ def test_an_explicit_flag_beats_the_contact_default(tmp_path, monkeypatch, store
 
 
 def test_a_contact_without_a_setting_still_refuses(tmp_path, monkeypatch, capsys):
-    """Unchanged behaviour for everyone who has not opted in."""
+    """Unchanged behavior for everyone who has not opted in."""
     from imsgread import main
 
     cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
@@ -849,7 +849,7 @@ def test_find_groups_refuses_without_a_participant(capsys, db):
     assert "error" in capsys.readouterr().err.lower()
 
 
-def test_a_group_send_honours_the_alias_marker(tmp_path, monkeypatch, db):
+def test_a_group_send_honors_the_alias_marker(tmp_path, monkeypatch, db):
     """Per the decision recorded for this tool: a group alias carries one
     marker setting, exactly like a one-to-one contact."""
     from imsgread import main
