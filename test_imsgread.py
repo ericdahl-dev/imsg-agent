@@ -20,7 +20,6 @@ from imsgread import (
     ScopeError,
     apple_time,
     decode_attributed_body,
-    read_thread,
     resolve_chat,
 )
 
@@ -121,7 +120,7 @@ def test_resolve_chat_rejects_unknown_contact(monkeypatch):
 
 def test_read_thread_refuses_empty_chat_id():
     with pytest.raises(ScopeError):
-        read_thread("", db_path=Path("/nonexistent"))
+        imsgread.ChatStore(Path("/nonexistent")).read_thread("")
 
 
 # --------------------------------------------------------------------------
@@ -189,47 +188,42 @@ def db(tmp_path: Path) -> Path:
 
 
 def test_reads_only_the_requested_thread(db):
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     assert all("OTHER THREAD" != (m.text or "") for m in msgs)
     assert len(msgs) == 3  # empty row dropped, attachment kept
 
 
 def test_prefers_text_column_then_falls_back_to_blob(db):
-    msgs = {m.text for m in read_thread("+15555550123", db_path=db)}
+    msgs = {m.text for m in imsgread.ChatStore(db).read_thread("+15555550123")}
     assert "plain text column wins" in msgs
     assert "first from them" in msgs
 
 
 def test_newest_first(db):
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     assert msgs[0].has_attachment is True          # rowid 3 is newest surviving
 
 
 def test_returns_both_sides_of_the_conversation(db):
     """Both directions must come back. Reading only the other side loses what
     you already said -- and therefore what is still unanswered."""
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     assert any(m.from_me for m in msgs), "lost the sent side"
     assert any(not m.from_me for m in msgs), "lost the received side"
 
 
 def test_direction_is_not_inverted(db):
     """rowid 2 is the only is_from_me=1 row in the fixture."""
-    sent = [m for m in read_thread("+15555550123", db_path=db) if m.from_me]
+    sent = [m for m in imsgread.ChatStore(db).read_thread("+15555550123") if m.from_me]
     assert [m.text for m in sent] == ["plain text column wins"]
 
 
 def test_include_empty_keeps_bodyless_rows(db):
-    assert len(read_thread("+15555550123", db_path=db, include_empty=True)) == 4
+    assert len(imsgread.ChatStore(db).read_thread("+15555550123", include_empty=True)) == 4
 
 
 def test_limit_is_applied(db):
-    assert len(read_thread("+15555550123", db_path=db, limit=1)) <= 1
-
-
-def test_missing_database_raises(tmp_path):
-    with pytest.raises(FileNotFoundError):
-        read_thread("+15555550123", db_path=tmp_path / "nope.db")
+    assert len(imsgread.ChatStore(db).read_thread("+15555550123", limit=1)) <= 1
 
 
 def test_render_is_readable():
@@ -240,7 +234,7 @@ def test_render_is_readable():
 def test_a_group_thread_attributes_each_sender(db):
     """Collapsing a group into one word makes the transcript quotable but
     misattributable, which is worse than not reading it at all."""
-    msgs = read_thread("chat9001", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("chat9001")
     said = {m.sender: m.text for m in msgs if not m.from_me}
     assert len(said) == 2, said
     assert set(said.values()) == {"from alice", "from carol"}
@@ -249,7 +243,7 @@ def test_a_group_thread_attributes_each_sender(db):
 
 def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
     """The whole point of contacts.toml is that numbers stay out of output."""
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     assert all(m.sender is None for m in msgs)
     rendered = "\n".join(m.render() for m in msgs)
     assert "+15555550123" not in rendered
@@ -257,7 +251,7 @@ def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
 
 
 def test_group_senders_use_a_known_name_and_mask_the_rest(db):
-    msgs = read_thread("chat9001", db_path=db,
+    msgs = imsgread.ChatStore(db).read_thread("chat9001",
                        labels={"+15555550123": "alice"})
     senders = {m.sender for m in msgs if not m.from_me}
     assert "alice" in senders
@@ -268,7 +262,7 @@ def test_group_senders_use_a_known_name_and_mask_the_rest(db):
 def test_an_attachment_reports_its_type_size_and_path(db):
     """[attachment] says something arrived but not what. Type, size and path
     are what make a transcript actionable."""
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     shot = next(m for m in msgs if m.has_attachment)
     kept = next(a for a in shot.attachments if a.exists)
 
@@ -283,7 +277,7 @@ def test_an_attachment_reports_its_type_size_and_path(db):
 def test_an_attachment_no_longer_on_disk_is_marked_missing(db):
     """About one in eight recent attachments is already gone; a read must
     treat that as normal rather than as an error."""
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     shot = next(m for m in msgs if m.has_attachment)
     gone = next(a for a in shot.attachments if not a.exists)
 
@@ -292,7 +286,7 @@ def test_an_attachment_no_longer_on_disk_is_marked_missing(db):
 
 
 def test_a_message_without_an_attachment_is_unchanged(db):
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     plain = next(m for m in msgs if m.text == "plain text column wins")
     assert plain.attachments == []
     assert plain.render().endswith("plain text column wins")
@@ -893,40 +887,36 @@ def test_a_group_send_honors_the_alias_marker(tmp_path, monkeypatch, db):
     assert seen["guid"] == "iMessage;+;chat9001"
 
 
-def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, monkeypatch):
+def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, monkeypatch, db):
     """A green thread is only reachable through its own guid. The participant
     path is pinned to the iMessage account, so addressing an SMS or RCS chat
     that way writes the message into the thread and never delivers it."""
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+                     '[contacts]\neric = { id = "+15555550123", marker = true }\n')
     seen = {}
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
-    monkeypatch.setattr("imsgread.chat_shape",
-                        lambda chat_id, db_path=None: ("any;-;+1555", 1))
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot, **kw: seen.update(kw))
 
-    assert main(send_args(cfg)) == 0
-    assert seen["guid"] == "any;-;+1555"
+    assert main(send_args(cfg, "--db", str(db))) == 0
+    assert seen["guid"] == "iMessage;-;+15555550123"
 
 
-def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch):
+def test_a_first_message_has_no_guid_to_prefer(tmp_path, monkeypatch, db):
     """Nobody has a chat row before the first message. That is the one case
     where addressing a participant directly is the only option."""
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+                     '[contacts]\neric = { id = "+15555550000", marker = true }\n')
     seen = {}
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
-    monkeypatch.setattr("imsgread.chat_shape",
-                        lambda chat_id, db_path=None: (None, 0))
     monkeypatch.setattr("imsgread.send_message",
                         lambda chat, text, robot, **kw: seen.update(kw))
 
-    assert main(send_args(cfg)) == 0
+    assert main(send_args(cfg, "--db", str(db))) == 0
     assert seen["guid"] is None
 
 
@@ -966,7 +956,7 @@ def add_sent(path: Path, rowid: int, chat: int, *, delivered=0, error=0, service
 def test_a_delivered_message_is_reported_as_delivered(delivery_db):
     add_sent(delivery_db, 10, 1, delivered=1)
 
-    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+    result = imsgread.confirm_delivery(imsgread.ChatStore(delivery_db), "+15555550123", 0, timeout=0)
 
     assert result.status == "delivered"
     assert result.render() == "delivered over iMessage"
@@ -977,7 +967,7 @@ def test_an_undelivered_message_reports_the_error_code(delivery_db):
     exited 0, and the send failed afterwards with error 22."""
     add_sent(delivery_db, 10, 1, error=22)
 
-    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+    result = imsgread.confirm_delivery(imsgread.ChatStore(delivery_db), "+15555550123", 0, timeout=0)
 
     assert result.status == "failed"
     assert result.error == 22
@@ -989,45 +979,41 @@ def test_a_missing_receipt_is_not_called_a_failure(delivery_db):
     would cry wolf on every green thread that worked perfectly well."""
     add_sent(delivery_db, 10, 1, delivered=0, service="SMS")
 
-    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
+    result = imsgread.confirm_delivery(imsgread.ChatStore(delivery_db), "+15555550123", 0, timeout=0)
 
     assert result.status == "unconfirmed"
     assert result.render() == "no delivery receipt over SMS"
 
 
-def test_confirmation_ignores_anything_older_than_the_send(delivery_db):
+def test_the_store_ignores_rows_at_or_below_the_floor(delivery_db):
     """The floor is what makes this the message we just sent rather than
     whatever already sat at the end of the thread."""
     add_sent(delivery_db, 10, 1, error=22)
 
-    result = imsgread.confirm_delivery("+15555550123", 10, delivery_db, timeout=0)
-
-    assert result.status == "unconfirmed"
+    assert imsgread.ChatStore(delivery_db).sent_after("+15555550123", 10) is None
 
 
-def test_confirmation_never_reads_another_thread(delivery_db):
+def test_the_store_never_reports_another_threads_row(delivery_db):
     """Scoped like every other query here: a failure in someone else's thread
     is not this send's failure."""
     add_sent(delivery_db, 10, 2, error=22)
 
-    result = imsgread.confirm_delivery("+15555550123", 0, delivery_db, timeout=0)
-
-    assert result.status == "unconfirmed"
+    assert imsgread.ChatStore(delivery_db).sent_after("+15555550123", 0) is None
 
 
 def test_the_floor_is_the_newest_outgoing_row(delivery_db):
     add_sent(delivery_db, 10, 1)
     add_sent(delivery_db, 11, 1)
 
-    assert imsgread.last_sent_rowid("+15555550123", delivery_db) == 11
-    assert imsgread.last_sent_rowid("+15555559999", delivery_db) == 0
+    store = imsgread.ChatStore(delivery_db)
+    assert store.last_sent_rowid("+15555550123") == 11
+    assert store.last_sent_rowid("+15555559999") == 0
 
 
 def test_an_unreadable_database_is_unconfirmed_rather_than_delivered(tmp_path):
     """Losing Full Disk Access must not turn into a false confirmation."""
-    assert imsgread.last_sent_rowid("+15555550123", tmp_path / "missing.db") is None
-    assert imsgread.confirm_delivery("+15555550123", None,
-                                     tmp_path / "missing.db", timeout=0).status == "unconfirmed"
+    store = imsgread.ChatStore(tmp_path / "missing.db")
+    assert imsgread.confirm_delivery(store, "+15555550123", 0, timeout=0).status == "unconfirmed"
 
 
 def test_a_failed_delivery_makes_the_command_fail(tmp_path, monkeypatch, capsys):
@@ -1038,7 +1024,6 @@ def test_a_failed_delivery_makes_the_command_fail(tmp_path, monkeypatch, capsys)
                      '[contacts]\neric = { id = "+1555", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
-    monkeypatch.setattr("imsgread.last_sent_rowid", lambda *a, **k: 0)
     monkeypatch.setattr("imsgread.confirm_delivery",
                         lambda *a, **k: Delivery("failed", "iMessage", 22))
 
@@ -1055,7 +1040,6 @@ def test_a_send_without_a_receipt_still_succeeds(tmp_path, monkeypatch, capsys):
                      '[contacts]\neric = { id = "+1555", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr("imsgread.send_message", lambda *a, **k: None)
-    monkeypatch.setattr("imsgread.last_sent_rowid", lambda *a, **k: 0)
     monkeypatch.setattr("imsgread.confirm_delivery",
                         lambda *a, **k: Delivery("unconfirmed", "SMS"))
 
@@ -1067,7 +1051,7 @@ def test_link_previews_are_not_reported_as_attachments(db):
     """Messages writes a pluginPayloadAttachment per URL. They cannot be
     opened or forwarded and the link is already in the message text, so
     listing them buries the real files under path noise."""
-    msgs = read_thread("+15555550123", db_path=db)
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
     shot = next(m for m in msgs if m.has_attachment)
 
     assert len(shot.attachments) == 2
@@ -1177,3 +1161,47 @@ def test_a_thread_warns_only_once_it_trails_by_more_than_a_day(hours_behind, war
     newest = NOW - timedelta(hours=hours_behind)
     note = imsgread.staleness_note([_sent_at(newest.isoformat())], NOW, now=NOW)
     assert (note is not None) == warns
+
+
+# --------------------------------------------------------------------------
+# chat store -- the one module that opens chat.db
+# --------------------------------------------------------------------------
+
+def test_the_store_reads_one_thread(db):
+    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    assert {m.text for m in msgs} == {"plain text column wins", "first from them", None}
+
+
+@pytest.mark.parametrize("make", [
+    lambda p: None,                              # missing
+    lambda p: p.write_bytes(b"not a database"),  # unreadable
+])
+def test_every_database_failure_is_one_store_error(tmp_path, make):
+    """Read and send used to translate these three different ways."""
+    path = tmp_path / "chat.db"
+    make(path)
+    with pytest.raises(imsgread.StoreError):
+        imsgread.ChatStore(path).read_thread("+15555550123")
+
+
+@pytest.mark.parametrize("chat_id, guid, is_group", [
+    ("+15555550123", "iMessage;-;+15555550123", False),
+    ("chat9001", "iMessage;+;chat9001", True),
+    ("chat9002", None, True),             # a group Messages cannot address
+    ("+15555550000", None, False),        # no row yet: a first message
+])
+def test_the_store_says_what_a_chat_is(db, chat_id, guid, is_group):
+    chat = imsgread.ChatStore(db).chat(chat_id)
+    assert (chat.guid, chat.is_group) == (guid, is_group)
+
+
+def test_the_store_finds_only_groups_one_participant_is_in(db):
+    groups = imsgread.ChatStore(db).find_groups("+15555559999")
+    assert [g[0] for g in groups] == ["chat9001", "chat9002"]
+
+
+def test_the_store_knows_when_it_was_last_written(db):
+    import os
+
+    os.utime(db, (1_700_000_000, 1_700_000_000))
+    assert imsgread.ChatStore(db).updated().timestamp() == 1_700_000_000
