@@ -1322,12 +1322,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if not entries:
-            searched = "\n  ".join(str(c) for c in contacts_candidates())
-            print(
-                f"no contacts configured -- create {args.contacts_file or CONFIG_CONTACTS}\n"
-                f"searched:\n  {searched}",
-                file=sys.stderr,
-            )
+            # Name the file actually in force: --contacts-file, then a set
+            # $IMSG_AGENT_CONTACTS, then the search. Pointing anywhere else
+            # sends someone to edit a file this run never reads.
+            in_force = args.contacts_file or contacts_path()
+            if in_force.exists():
+                hint = f"add contacts to {in_force}"
+            elif args.contacts_file or os.environ.get(CONTACTS_ENV):
+                hint = f"create {in_force}"
+            else:
+                searched = "\n  ".join(str(c) for c in contacts_candidates())
+                hint = f"create {in_force}\nsearched:\n  {searched}"
+            print(f"no contacts configured -- {hint}", file=sys.stderr)
             return 1
         for name, contact in entries:
             # Only shown when set, so a contact with no standing decision reads

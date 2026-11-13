@@ -6,6 +6,7 @@ so no real message content lives in the repo.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1348,3 +1349,85 @@ def test_no_target_is_refused():
 ])
 def test_the_book_names_a_handle_or_masks_it(book_file, handle, shown):
     assert imsgread.ContactBook.open(book_file).label(handle) == shown
+
+
+# --- a raw --chat never needed contacts.toml ---------------------------------
+
+@pytest.mark.parametrize("setup", ["broken", "env-missing"])
+def test_a_raw_chat_read_survives_an_unusable_contacts_file(db, tmp_path, monkeypatch, capsys, setup):
+    """No names to print, so group senders come out masked -- but the read works."""
+    if setup == "broken":
+        bad = write_toml(tmp_path / "c.toml", "[contacts\nnot toml")
+        args = ["--contacts-file", str(bad)]
+    else:
+        monkeypatch.setenv("IMSG_AGENT_CONTACTS", str(tmp_path / "typo.toml"))
+        args = []
+
+    assert main(["--chat", "chat9001", "--db", str(db), *args]) == 0
+    senders = {m["sender"] for m in json.loads(capsys.readouterr().out)}
+    assert senders == {"*0123", "*1111", None}
+
+
+def test_a_contact_read_reports_an_unusable_contacts_file(db, tmp_path, capsys):
+    bad = write_toml(tmp_path / "c.toml", "[contacts\nnot toml")
+    assert main(["--contact", "friend", "--db", str(db), "--contacts-file", str(bad)]) == 1
+    assert "not valid TOML" in capsys.readouterr().err
+
+
+# --- waiting for a receipt -----------------------------------------------------
+
+def test_a_receipt_that_arrives_late_is_waited_for(send_db):
+    """Messages writes the row at once and the receipt a moment later. Every
+    other test checks once; this is the loop a real send runs."""
+    import threading
+    import time as _time
+
+    fake = FakeTransport(send_db, delivered=0)
+
+    def deliver_soon():
+        _time.sleep(0.1)
+        conn = sqlite3.connect(send_db)
+        conn.execute("update message set is_delivered = 1 where ROWID = (select max(ROWID) from message)")
+        conn.commit()
+        conn.close()
+
+    threading.Thread(target=deliver_soon).start()
+    delivery = imsgread.send(imsgread.ChatStore(send_db), fake, "+15555550123", "hi",
+                             robot=False, timeout=5, interval=0.01)
+
+    assert delivery.render() == "delivered over iMessage"
+
+
+def test_a_receipt_that_never_arrives_waits_out_the_timeout(send_db):
+    import time as _time
+
+    fake = FakeTransport(send_db, delivered=0, service="SMS")
+    started = _time.monotonic()
+    delivery = imsgread.send(imsgread.ChatStore(send_db), fake, "+15555550123", "hi",
+                             robot=False, timeout=0.2, interval=0.01)
+
+    assert _time.monotonic() - started >= 0.2
+    assert delivery.render() == "no delivery receipt over SMS"
+
+
+# --- an empty contacts listing points at the file in force -------------------
+
+def test_an_empty_listing_names_the_contacts_file_given(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", tmp_path / "config.toml")
+    empty = write_toml(tmp_path / "empty.toml", "[contacts]\n")
+
+    assert main(["--contacts", "--contacts-file", str(empty)]) == 1
+    err = capsys.readouterr().err
+    assert f"create {empty}" in err or f"add contacts to {empty}" in err
+    assert "config.toml" not in err
+
+
+def test_an_empty_listing_names_the_env_var_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", tmp_path / "config.toml")
+    empty = write_toml(tmp_path / "env.toml", "[contacts]\n")
+    monkeypatch.setenv("IMSG_AGENT_CONTACTS", str(empty))
+
+    assert main(["--contacts"]) == 1
+    err = capsys.readouterr().err
+    assert str(empty) in err
+    assert "config.toml" not in err
