@@ -153,7 +153,7 @@ this repo, so they work from whatever directory the agent happens to be in.
 --oldest-first       chronological instead of newest-first
 --include-empty      keep rows with no body
 --db PATH            alternate chat.db
---contacts           list configured contacts (numbers masked) and exit
+--contacts           list configured contacts (identifiers masked) and exit
 --unmask             with --contacts, print full identifiers
 --contacts-file PATH alternate contacts.toml for this run
 --find-groups        list group chats --contact/--chat is a member of

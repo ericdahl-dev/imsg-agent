@@ -605,8 +605,10 @@ def staleness_note(
     dates = [datetime.fromisoformat(m.date) for m in messages if m.date]
     if not dates:
         return (
-            "note: no messages found for this chat. That is not proof there are "
-            "none -- check Messages on this Mac."
+            "note: no messages with a body found for this chat. That is not proof "
+            "there are none: rows with no text are hidden without --include-empty, "
+            "and this Mac can miss messages your phone has. Check Messages on this "
+            "Mac."
         )
     newest = max(dates)
     if db_updated is not None and db_updated - newest > STALE_AFTER:

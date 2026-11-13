@@ -943,8 +943,10 @@ def test_a_database_nobody_has_written_to_in_days_is_reported():
 def test_an_empty_thread_is_not_reported_as_proof_of_silence():
     note = imsgread.staleness_note([], NOW, now=NOW)
     assert note == (
-        "note: no messages found for this chat. That is not proof there are "
-        "none -- check Messages on this Mac."
+        "note: no messages with a body found for this chat. That is not proof "
+        "there are none: rows with no text are hidden without --include-empty, "
+        "and this Mac can miss messages your phone has. Check Messages on this "
+        "Mac."
     )
 
 
