@@ -558,6 +558,72 @@ def mask_handle(handle: str) -> str:
     return f"*{handle[-4:]}" if len(handle) > 4 else handle
 
 
+# How far a thread may trail the database before a read says so. A day:
+# quieter than that is ordinary, and a missed sync shorter than that rarely
+# changes what an agent reports.
+STALE_AFTER = timedelta(hours=24)
+
+
+def database_updated(db_path: Path = DEFAULT_DB) -> datetime | None:
+    """When chat.db was last written, counting its write-ahead log.
+
+    Taken from file times, not from the message table: asking the database for
+    its newest message would read across every thread on the machine, which
+    nothing here does. New rows land in chat.db-wal first and the main file can
+    lag it for hours, so the newer of the two is the answer.
+    """
+    times = [
+        p.stat().st_mtime
+        for p in (db_path, db_path.with_name(db_path.name + "-wal"))
+        if p.exists()
+    ]
+    if not times:
+        return None
+    return datetime.fromtimestamp(max(times), tz=timezone.utc)
+
+
+def _fmt(stamp: datetime) -> str:
+    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def staleness_note(
+    messages: list[Message],
+    db_updated: datetime | None,
+    now: datetime | None = None,
+) -> str | None:
+    """A warning when a thread may be missing messages, or None.
+
+    An old result and a quiet thread look identical, and an agent will report
+    the first as the second: "they haven't written in two days" when this Mac
+    simply never received the messages (iCloud sync on a Mac can stall
+    silently). This cannot tell the two apart -- only the reader can, by
+    opening Messages -- so it says the result is not proof rather than
+    claiming either one.
+    """
+    now = now or datetime.now(timezone.utc)
+    if db_updated is not None and now - db_updated > STALE_AFTER:
+        return (
+            f"note: chat.db has not been updated since {_fmt(db_updated)}; this "
+            "Mac may not be receiving messages. Treat this thread as possibly "
+            "incomplete."
+        )
+    dates = [datetime.fromisoformat(m.date) for m in messages if m.date]
+    if not dates:
+        return (
+            "note: no messages found for this chat. That is not proof there are "
+            "none -- check Messages on this Mac."
+        )
+    newest = max(dates)
+    if db_updated is not None and db_updated - newest > STALE_AFTER:
+        return (
+            f"note: newest message here is {_fmt(newest)}, but chat.db was "
+            f"updated {_fmt(db_updated)}. The thread may just be quiet, but that "
+            "is not proof: this Mac can miss messages your phone has. Check "
+            "Messages on this Mac before reporting nothing new."
+        )
+    return None
+
+
 def chat_shape(chat_id: str, db_path: Path = DEFAULT_DB) -> tuple[str | None, int]:
     """The chat's guid and participant count, for one identifier.
 
@@ -874,7 +940,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-timeout", type=float, default=10.0, metavar="SECONDS",
                    help="how long to wait for a delivery result after sending "
                         "(0 checks once and does not wait)")
-    p.add_argument("--contacts", action="store_true", help="list configured contacts and exit")
+    p.add_argument("--contacts", action="store_true",
+                   help="list configured contacts (identifiers masked) and exit")
+    p.add_argument("--unmask", action="store_true",
+                   help="with --contacts, print full identifiers")
     p.add_argument("--find-groups", action="store_true",
                    help="list group chats that --contact/--chat is a member of")
     p.add_argument("--contacts-file", type=Path, default=None,
@@ -1125,7 +1194,10 @@ def main(argv: list[str] | None = None) -> int:
             # Only shown when set, so a contact with no standing decision reads
             # exactly as it did before settings existed.
             suffix = "" if contact.marker is None else f"\tmarker={marker_word(contact.marker)}"
-            print(f"{name}\t{contact.identifier}{suffix}")
+            # Masked unless asked: an agent lists contacts to learn the names,
+            # and printing every number would put them all in its transcript.
+            shown = contact.identifier if args.unmask else mask_handle(contact.identifier)
+            print(f"{name}\t{shown}{suffix}")
         return 0
 
     if args.find_groups:
@@ -1146,6 +1218,12 @@ def main(argv: list[str] | None = None) -> int:
     except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    # stderr, so JSON on stdout stays parseable and the note still reaches
+    # whoever reads the output.
+    note = staleness_note(messages, database_updated(args.db))
+    if note:
+        print(note, file=sys.stderr)
 
     if args.oldest_first:
         messages.reverse()

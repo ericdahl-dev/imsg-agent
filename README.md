@@ -153,7 +153,8 @@ this repo, so they work from whatever directory the agent happens to be in.
 --oldest-first       chronological instead of newest-first
 --include-empty      keep rows with no body
 --db PATH            alternate chat.db
---contacts           list configured contacts and exit
+--contacts           list configured contacts (numbers masked) and exit
+--unmask             with --contacts, print full identifiers
 --contacts-file PATH alternate contacts.toml for this run
 --find-groups        list group chats --contact/--chat is a member of
 
@@ -166,6 +167,15 @@ this repo, so they work from whatever directory the agent happens to be in.
 ```
 
 One of `--chat` or `--contact` is always required.
+
+**A read warns when the thread may be incomplete.** A quiet thread and one
+this Mac never received look identical, and an agent will report the second as
+the first. When a thread's newest message trails `chat.db`'s last write (file
+time, including `chat.db-wal`) by more than a day, or the database itself has
+not been written for a day, a `note:` line goes to stderr. It cannot tell the
+two cases apart -- opening the conversation in Messages on this Mac does -- so
+it says the result is not proof. The check reads file times, never the message
+table, so it does not look across threads.
 
 JSON output, newest first:
 

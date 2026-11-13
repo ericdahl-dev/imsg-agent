@@ -25,6 +25,8 @@ The commands below call the installed `imsg-agent` executable, so they work from
 - The marker is appended to the message body. Tapbacks are deliberately unsupported: Messages has no reaction API, and UI scripting cannot confirm one attached, so a tapback marker can silently fail to appear. Do not try to add one with AppleScript or System Events.
 - Prefer `--message-file` for anything longer than a short plain-text message, or anything with quotes, apostrophes, newlines, or emoji.
 - If reading fails on macOS, check Full Disk Access for the terminal before changing code. Granting it does not reach a process that is already running: restart the session afterwards, or every read still fails.
+- A `note:` line on stderr means the thread may be missing messages this Mac never received. Do not report "nothing new" or "they've been quiet" as fact; tell the user the result may be stale and suggest checking Messages.
+- `--contacts` masks numbers (`*0123`) so they stay out of transcripts. The names are what you need; don't pass `--unmask` unless the user asks for a number.
 - Timestamps are printed in UTC. `16:44` is `12:44` US Eastern — do not read a message as hours newer than it is.
 
 ## Common commands
