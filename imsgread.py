@@ -1073,26 +1073,21 @@ def _resolve_marker_choice(
     standing decision from contacts.toml, then a human at a terminal, and
     otherwise a refusal.
 
-    Silence from an agent is not consent to send unmarked. A stored "always
-    mark" may answer for a program, because it fails safe. A stored "never"
-    may not: contacts.toml is a file an agent can write, so it cannot prove a
-    person chose that. From a program, unmarked takes an explicit --no-robot.
-    At a terminal the stored "never" stands -- the person who would answer is
-    the one who set it.
+    Silence from an agent is still not consent to send unmarked -- that is what
+    the last branch is for. A configured value is not silence: it is a decision
+    a person made about this contact ahead of time, which is why it may answer
+    for a program when nothing else can. That only holds while a person is the
+    one who wrote it, so `--config` refuses to run without a terminal.
     """
     if robot is not None:
         return robot
-    interactive = sys.stdin.isatty()
-    if configured is True or (configured is False and interactive):
+    if configured is not None:
         return configured
-    if not interactive:
-        hint = (
-            "this contact is set to never mark, but that only answers at a "
-            "terminal; pass --no-robot to send unmarked, or --robot"
-            if configured is False
-            else "pass --robot or --no-robot when not running interactively"
+    if not sys.stdin.isatty():
+        print(
+            "error: pass --robot or --no-robot when not running interactively",
+            file=sys.stderr,
         )
-        print(f"error: {hint}", file=sys.stderr)
         return None
     answer = input(f"Mark this as sent by an agent ({AGENT_MARKER})? [Y/n] ").strip().lower()
     return answer not in {"n", "no"}
