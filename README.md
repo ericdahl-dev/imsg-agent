@@ -24,7 +24,7 @@ didn't decode had no body at all (one attachment-only, one empty).
 
 **Scoping is a safety property, not a preference.** `~/Library/Messages/chat.db`
 holds every conversation on the machine — family, friends, personal logistics.
-There is no code path here that reads across threads: `ChatStore.read_thread` requires a
+There is no code path here that reads across threads: `ChatStore.read` requires a
 chat identifier, and the CLI exits non-zero without one. A rule written in prose
 depends on the reader choosing to follow it. This one does not.
 
@@ -251,7 +251,10 @@ Or as a module, if you have a clone but no install: `python3 imsgread.py
 from imsgread import DEFAULT_DB, ChatStore
 
 store = ChatStore(DEFAULT_DB)   # no default path: reaching real messages is a choice
-for m in store.read_thread("+15555550123", limit=20):
+transcript = store.read("+15555550123", limit=20)
+if transcript.note:            # set when this Mac may be missing messages
+    print(transcript.note)
+for m in transcript.messages:  # newest first
     print(m.date, "me" if m.from_me else "them", m.text)
 ```
 
@@ -269,7 +272,7 @@ from imsgread import ContactBook
 book = ContactBook.open()                 # contacts.toml, found as described above
 friend = book.resolve(contact="friend")   # Recipient: identifier, name, standing marker
 print(friend.display)                     # "friend" -- never the number
-store.read_thread(friend.identifier, name_for=book.label)   # group senders by name
+store.read(friend.identifier, name_for=book.label)   # group senders by name
 ```
 
 Every database failure (missing file, no Full Disk Access, corrupt file) is a
