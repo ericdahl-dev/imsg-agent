@@ -143,7 +143,15 @@ def contacts_candidates() -> list[Path]:
 
 
 def contacts_path() -> Path:
-    """The contacts file in effect, or where to create one if none exists."""
+    """The contacts file in effect, or where to create one if none exists.
+
+    A set $IMSG_AGENT_CONTACTS is the answer whether or not the file exists
+    yet: falling through to another file would put a different set of
+    contacts in force than the one the caller named.
+    """
+    env = os.environ.get(CONTACTS_ENV)
+    if env:
+        return Path(env).expanduser()
     for candidate in contacts_candidates():
         if candidate.exists():
             return candidate
@@ -212,6 +220,10 @@ def load_contact_entries(path: Path | None = None) -> dict[str, Contact]:
     """Every contact with its settings."""
     if path is None:
         path = contacts_path()
+        if os.environ.get(CONTACTS_ENV) and not path.exists():
+            raise ConfigError(
+                f"${CONTACTS_ENV} points to {path}, which does not exist"
+            )
     if not path.exists():
         return {}
     with path.open("rb") as fh:

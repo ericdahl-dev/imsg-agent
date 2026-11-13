@@ -104,7 +104,7 @@ Contacts are searched for in this order, first hit wins:
 
 | Location | Use |
 | --- | --- |
-| `$IMSG_AGENT_CONTACTS` | explicit override for a shell or a session |
+| `$IMSG_AGENT_CONTACTS` | explicit override for a shell or a session; when set it is the only file used, a missing one is an error, and `--config` writes there |
 | `~/.config/imsg-agent/contacts.toml` | normal install; survives upgrades |
 | `contacts.toml` beside the module | a clone or editable install, i.e. the repo root |
 
