@@ -52,11 +52,13 @@ colleague = { id = "+15555550124", marker = false }     # never marked
 ```
 
 An explicit flag still wins; a contact with no setting behaves exactly as
-before. This is the one place a value may answer for a program that said
-nothing, which is a real weakening of the rule above and only sound while a
-person is the one who wrote it. So the setting is not editable by a program:
-`imsg-agent --config` refuses to run without a terminal. A config file an agent
-can write is not a record of consent, it is a note the agent left itself.
+before. The two settings are not symmetric. `marker = true` answers for a
+program that said nothing, because marking fails safe. `marker = false` answers
+only at a terminal: a program still has to pass `--no-robot` to send unmarked.
+`--config` refuses to run without a terminal, but `contacts.toml` is a file an
+agent can write anyway, and a config file an agent can write is not a record of
+consent, it is a note the agent left itself. So a stored "never" is never what
+lets a program skip the marker.
 
 **The marker goes in the body, because a tapback cannot be trusted.** A 🤖
 reaction would read better than an appended emoji, and it is not supported on

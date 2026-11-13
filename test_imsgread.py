@@ -547,17 +547,39 @@ def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
     assert "colleague" in str(exc.value)
 
 
-@pytest.mark.parametrize("stored, expected", [("false", False), ("true", True)])
-def test_a_contact_default_answers_for_a_program(tmp_path, messages, send_db, monkeypatch, stored, expected):
-    """The one behavior change: silence now resolves to a decision a person
-    recorded, instead of being refused."""
+def test_a_stored_always_marks_for_a_program(tmp_path, messages, send_db, monkeypatch):
+    """Silence resolves to a recorded "always mark": that fails safe."""
     cfg = write_toml(tmp_path / "c.toml",
-                     f'[contacts]\ncolleague = {{ id = "+1555", marker = {stored} }}\n')
+                     '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) == 0
     assert messages.calls[-1][1] == "+1555"
-    assert was_marked(messages) is expected
+    assert was_marked(messages) is True
+
+
+def test_a_stored_never_does_not_answer_for_a_program(tmp_path, messages, send_db, monkeypatch, capsys):
+    """contacts.toml is a file an agent can edit, so a stored "never" cannot be
+    proof a person chose it. Unmarked from a program takes an explicit flag."""
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
+
+    assert main(send_args(cfg, send_db)) != 0
+    assert "--no-robot" in capsys.readouterr().err
+    assert messages.calls == []
+
+
+def test_a_stored_never_still_answers_for_a_person(tmp_path, messages, send_db, monkeypatch):
+    """At a terminal nobody is asked: the person who would answer is the one
+    who set it."""
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
+    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("must not ask"))
+
+    assert main(send_args(cfg, send_db)) == 0
+    assert was_marked(messages) is False
 
 
 @pytest.mark.parametrize("stored, flag, expected", [
@@ -1244,7 +1266,7 @@ def test_a_send_reports_the_contact_name_not_the_number(tmp_path, messages, send
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+15555550123", marker = false }\n')
 
-    assert main(send_args(cfg, send_db)) == 0
+    assert main(send_args(cfg, send_db, "--no-robot")) == 0
     err = capsys.readouterr().err
     assert "+15555550123" not in err
     assert err.startswith("sent to colleague (")

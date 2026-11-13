@@ -20,7 +20,7 @@ The commands below call the installed `imsg-agent` executable, so they work from
 - Never send to “the last conversation” or any inferred recipient. Resolve the target explicitly.
 - The marker reflects whose words they are, not who typed them. For agent-authored sends, use `--robot` so the outgoing message is marked with 🤖.
 - Use `--no-robot` only for words a human wrote or approved as their own, and only when they approved that specific message. Drafting in someone's voice and having them say "send it" is theirs; composing on their behalf unreviewed is yours.
-- A contact may carry a standing decision in `contacts.toml` (`marker = true` always marks, `marker = false` never does), which answers when no flag is passed. Where there is no such setting, omitting the choice in a non-interactive run is still refused -- an agent must not be able to send unmarked by default.
+- A contact may carry a standing decision in `contacts.toml`. `marker = true` answers when you pass no flag. `marker = false` does not answer for you: as an agent you are non-interactive, so an unmarked send still needs an explicit `--no-robot`, and only pass it when the user wants that message unmarked. Never edit `contacts.toml` to change a marker setting. With no setting, omitting the choice is refused -- an agent must not be able to send unmarked by default.
 - Never write that setting yourself. It is the record of a decision a person made, and it is the only thing allowed to answer for a program, so an agent that sets it has granted itself permission to send unmarked. `imsg-agent --config` refuses to run without a terminal for exactly this reason. Ask the user to run it rather than writing the key with a shell redirect or an editor tool. Adding or repointing a contact alias is fine -- an identifier decides who a message reaches, which the user has already told you, and a wrong one fails loudly. A marker default decides what the recipient is told about who wrote it, silently, on every later send.
 - The marker is appended to the message body. Tapbacks are deliberately unsupported: Messages has no reaction API, and UI scripting cannot confirm one attached, so a tapback marker can silently fail to appear. Do not try to add one with AppleScript or System Events.
 - Prefer `--message-file` for anything longer than a short plain-text message, or anything with quotes, apostrophes, newlines, or emoji.
@@ -68,8 +68,9 @@ Send unmarked only when the user explicitly asks for that:
 imsg-agent --send --contact CONTACT_NAME --message-file reply.txt --no-robot
 ```
 
-A contact's standing decision, if it has one, shows in the contact listing and
-answers when no flag is given. Only the user can change it, at a terminal:
+A contact's standing decision, if it has one, shows in the contact listing.
+`marker=always` answers when no flag is given; `marker=never` still needs
+`--no-robot` from an agent. Only the user can change it, at a terminal:
 
 ```bash
 imsg-agent --config
