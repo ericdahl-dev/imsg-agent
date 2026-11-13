@@ -32,6 +32,28 @@ def no_real_chat_db(tmp_path, monkeypatch):
     monkeypatch.setattr(imsgread, "DEFAULT_DB", tmp_path / "no-real-chat.db")
 
 
+class FakeTerminal:
+    """A person at a keyboard, scripted: each ask() takes the next reply.
+
+    None for replies means no one is there, the way an agent runs."""
+
+    def __init__(self, replies=()):
+        self.interactive = replies is not None
+        self._replies = iter(replies or ())
+        self.prompts = []
+
+    def ask(self, prompt):
+        self.prompts.append(prompt)
+        return next(self._replies, None) if self.interactive else None
+
+
+@pytest.fixture(autouse=True)
+def no_one_at_the_terminal(monkeypatch):
+    """Every test runs the way an agent does unless it hands main() a
+    FakeTerminal with replies. Nothing may read the real stdin."""
+    monkeypatch.setattr(imsgread, "TERMINAL", FakeTerminal(None))
+
+
 def book_ids(book) -> dict[str, str]:
     return {name: c.identifier for name, c in book.items()}
 
@@ -332,7 +354,6 @@ def test_a_group_with_no_guid_is_refused_rather_than_guessed(messages, send_db, 
 
 def test_non_interactive_send_must_state_the_marker_choice(messages, send_db, monkeypatch, capsys):
     """An agent cannot send unmarked by omission."""
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     code = main(["--send", "--chat", "+15555550123", "--message", "hi", "--confirm-timeout", "0",
                  "--db", str(send_db)])
@@ -343,20 +364,26 @@ def test_non_interactive_send_must_state_the_marker_choice(messages, send_db, mo
 
 
 def test_non_interactive_send_proceeds_when_told(messages, send_db, monkeypatch):
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--robot",
                  "--confirm-timeout", "0", "--db", str(send_db)]) == 0
     assert messages.calls == [("chat", "any;-;+15555550123", "hi \U0001F916")]
 
 
-def test_interactive_send_asks_before_marking(messages, send_db, monkeypatch):
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda _: "n")
+def test_a_person_at_the_terminal_can_decline_the_marker(messages, send_db):
+    terminal = FakeTerminal(["n"])
 
     assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--confirm-timeout", "0",
-                 "--db", str(send_db)]) == 0
+                 "--db", str(send_db)], terminal=terminal) == 0
     assert messages.calls[-1][2] == "hi"
+    assert "Mark this" in terminal.prompts[0]
+
+
+def test_a_person_who_ends_input_at_the_marker_question_sends_nothing(messages, send_db):
+    """EOF at the prompt is no answer, not consent either way."""
+    assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--confirm-timeout", "0",
+                 "--db", str(send_db)], terminal=FakeTerminal([])) != 0
+    assert messages.calls == []
 
 
 # --- Claude skill ------------------------------------------------------------
@@ -542,7 +569,6 @@ def test_a_contact_default_answers_for_a_program(tmp_path, messages, send_db, mo
     recorded, instead of being refused."""
     cfg = write_toml(tmp_path / "c.toml",
                      f'[contacts]\ncolleague = {{ id = "+1555", marker = {stored} }}\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) == 0
     assert messages.calls[-1][1] == "+1555"
@@ -556,7 +582,6 @@ def test_a_contact_default_answers_for_a_program(tmp_path, messages, send_db, mo
 def test_an_explicit_flag_beats_the_contact_default(tmp_path, messages, send_db, monkeypatch, stored, flag, expected):
     cfg = write_toml(tmp_path / "c.toml",
                      f'[contacts]\ncolleague = {{ id = "+1555", marker = {stored} }}\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db, flag)) == 0
     assert was_marked(messages) is expected
@@ -565,7 +590,6 @@ def test_an_explicit_flag_beats_the_contact_default(tmp_path, messages, send_db,
 def test_a_contact_without_a_setting_still_refuses(tmp_path, messages, send_db, monkeypatch, capsys):
     """Unchanged behavior for everyone who has not opted in."""
     cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) != 0
     assert "--robot" in capsys.readouterr().err
@@ -577,7 +601,6 @@ def test_a_raw_chat_identifier_ignores_any_contact_default(tmp_path, messages, s
     recorded -- even when the same number is configured."""
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(["--send", "--chat", "+1555", "--message", "hi", "--confirm-timeout", "0",
                  "--contacts-file", str(cfg), "--db", str(send_db)]) != 0
@@ -677,7 +700,6 @@ def test_config_mode_refuses_without_a_terminal(tmp_path, monkeypatch, capsys):
     from imsgread import main
 
     cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(["--config", "--contacts-file", str(cfg)]) != 0
     assert "human at a terminal" in capsys.readouterr().err
@@ -692,11 +714,9 @@ def test_config_mode_records_a_decision(tmp_path, monkeypatch, word, expected):
 
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
-    replies = iter([f"set colleague marker {word}", "quit"])
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+    terminal = FakeTerminal([f"set colleague marker {word}", "quit"])
 
-    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    assert main(["--config", "--contacts-file", str(cfg)], terminal=terminal) == 0
     assert imsgread.load_contact_entries(cfg)["colleague"].marker is expected
 
 
@@ -707,11 +727,9 @@ def test_config_mode_adds_a_contact_and_keeps_its_decision(tmp_path, monkeypatch
 
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
-    replies = iter(["add family +1777", "add colleague +1888", "quit"])
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+    terminal = FakeTerminal(["add family +1777", "add colleague +1888", "quit"])
 
-    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    assert main(["--config", "--contacts-file", str(cfg)], terminal=terminal) == 0
     entries = imsgread.load_contact_entries(cfg)
     assert entries["family"] == imsgread.Contact("+1777", None)
     assert entries["colleague"] == imsgread.Contact("+1888", False)
@@ -721,11 +739,9 @@ def test_config_mode_survives_a_bad_command(tmp_path, monkeypatch, capsys):
     from imsgread import main
 
     cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
-    replies = iter(["nonsense", "set nobody marker never", "set colleague marker sometimes", "quit"])
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+    terminal = FakeTerminal(["nonsense", "set nobody marker never", "set colleague marker sometimes", "quit"])
 
-    assert main(["--config", "--contacts-file", str(cfg)]) == 0
+    assert main(["--config", "--contacts-file", str(cfg)], terminal=terminal) == 0
     out = capsys.readouterr().out
     assert "unknown command" in out
     assert "unknown contact" in out
@@ -765,7 +781,6 @@ def test_a_group_send_honors_the_alias_marker(tmp_path, messages, send_db, monke
     marker setting, exactly like a one-to-one contact."""
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncrew = { id = "chat9001", marker = true }\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     code = main(["--send", "--contact", "crew", "--message", "hi", "--confirm-timeout", "0",
                  "--contacts-file", str(cfg), "--db", str(send_db)])
@@ -780,13 +795,9 @@ def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, messages, send_db, mo
     that way writes the message into the thread and never delivers it."""
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+15555550123", marker = true }\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) == 0
     assert messages.calls[-1][:2] == ("chat", "any;-;+15555550123")
-
-
-
 
 
 # --------------------------------------------------------------------------
@@ -851,7 +862,6 @@ def test_a_failed_delivery_makes_the_command_fail(tmp_path, send_db, monkeypatch
     """A send that never arrived must not exit 0. That was the bug."""
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr(imsgread, "TRANSPORT", FakeTransport(send_db, delivered=0, error=22))
 
     assert main(send_args(cfg, send_db)) == 1
@@ -863,7 +873,6 @@ def test_a_send_without_a_receipt_still_succeeds(tmp_path, send_db, monkeypatch,
     rather than failing or claiming more than it knows."""
     cfg = write_toml(tmp_path / "c.toml",
                      '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
-    monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr(imsgread, "TRANSPORT", FakeTransport(send_db, delivered=0, service="SMS"))
 
     assert main(send_args(cfg, send_db)) == 0
@@ -1168,7 +1177,6 @@ def test_a_send_with_no_target_or_no_body_sends_nothing(send_db, chat_id, text, 
         imsgread.send(imsgread.ChatStore(send_db), fake, chat_id, text,
                       robot=False, timeout=0)
     assert fake.calls == []
-
 
 
 # --- the Messages adapter: the one place osascript runs -----------------------
