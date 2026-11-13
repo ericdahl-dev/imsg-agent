@@ -24,7 +24,7 @@ didn't decode had no body at all (one attachment-only, one empty).
 
 **Scoping is a safety property, not a preference.** `~/Library/Messages/chat.db`
 holds every conversation on the machine — family, friends, personal logistics.
-There is no code path here that reads across threads: `read_thread` requires a
+There is no code path here that reads across threads: `ChatStore.read_thread` requires a
 chat identifier, and the CLI exits non-zero without one. A rule written in prose
 depends on the reader choosing to follow it. This one does not.
 
@@ -47,8 +47,8 @@ the same for a given person every time, so a contact can carry a standing one:
 
 ```toml
 [contacts]
-brian = "+15555550123"                              # asked per message
-eric  = { id = "+15555550124", marker = false }     # never marked
+friend    = "+15555550123"                              # asked per message
+colleague = { id = "+15555550124", marker = false }     # never marked
 ```
 
 An explicit flag still wins; a contact with no setting behaves exactly as
@@ -209,9 +209,9 @@ the other person's number out of the output.
 Group identifiers cannot be guessed, so ask which groups a contact is in:
 
 ```
-$ imsg-agent --find-groups --contact brian
-chat41566504093568607	8 participants	Dudes Abide
-chat606231711236685994	6 participants
+$ imsg-agent --find-groups --contact friend
+chat100000000000000001	8 participants	trail crew
+chat200000000000000002	6 participants
 ```
 
 There is no way to list every group on the machine. The answer is always scoped
@@ -239,21 +239,28 @@ Or as a module, if you have a clone but no install: `python3 imsgread.py
 ## As a library
 
 ```python
-from imsgread import read_thread
+from imsgread import DEFAULT_DB, ChatStore
 
-for m in read_thread("+15555550123", limit=20):
+store = ChatStore(DEFAULT_DB)   # no default path: reaching real messages is a choice
+for m in store.read_thread("+15555550123", limit=20):
     print(m.date, "me" if m.from_me else "them", m.text)
 ```
 
 ```python
-from imsgread import send_message
+from imsgread import DEFAULT_DB, ChatStore, MessagesTransport, send
 
-send_message("+15555550123", "on my way", robot=True)   # sends "on my way 🤖"
+delivery = send(ChatStore(DEFAULT_DB), MessagesTransport(),
+                "+15555550123", "on my way", robot=True)   # sends "on my way 🤖"
+print(delivery.render())   # "delivered over iMessage", "no delivery receipt over SMS", ...
 ```
 
-`read_thread` raises `ScopeError` on an empty identifier, `FileNotFoundError`
-if the database is missing, and `PermissionError` with a pointer to the Full
-Disk Access setting when macOS blocks the read.
+Every database failure (missing file, no Full Disk Access, corrupt file) is a
+`StoreError`, with a pointer to the Full Disk Access setting. An empty
+identifier is a `ScopeError`. `send` refuses a group it cannot address rather
+than falling back to one participant, and raises `Unaddressable` when Messages
+will not address a group at all. The transport is a seam: anything with
+`to_chat(guid, body_path)` and `to_participant(handle, body_path)` works, which
+is how the tests send without Messages.
 
 ## The blob format
 

@@ -523,21 +523,34 @@ limit 1
 """
 
 
+class StoreError(RuntimeError):
+    """chat.db could not be read: missing, no Full Disk Access, or corrupt.
+
+    One type for every way the database can fail, so read and send report it
+    the same way instead of each guessing which sqlite exceptions matter.
+    """
+
+
+_ACCESS_HINT = (
+    "Grant Full Disk Access to your terminal in System Settings > "
+    "Privacy & Security."
+)
+
+
 @contextmanager
-def _connect(db_path: Path = DEFAULT_DB):
+def _connect(db_path: Path):
     """Open chat.db read-only. The database is never written by this tool."""
     if not db_path.exists():
-        raise FileNotFoundError(f"no chat database at {db_path}")
+        raise StoreError(f"no chat database at {db_path}")
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.OperationalError as exc:  # pragma: no cover - env specific
-        raise PermissionError(
-            f"cannot open {db_path}: {exc}. Grant Full Disk Access to your "
-            "terminal in System Settings > Privacy & Security."
-        ) from exc
+    except sqlite3.Error as exc:  # pragma: no cover - env specific
+        raise StoreError(f"cannot open {db_path}: {exc}. {_ACCESS_HINT}") from exc
     conn.row_factory = sqlite3.Row
     try:
         yield conn
+    except sqlite3.Error as exc:
+        raise StoreError(f"cannot read {db_path}: {exc}. {_ACCESS_HINT}") from exc
     finally:
         conn.close()
 
@@ -562,24 +575,6 @@ def mask_handle(handle: str) -> str:
 # quieter than that is ordinary, and a missed sync shorter than that rarely
 # changes what an agent reports.
 STALE_AFTER = timedelta(hours=24)
-
-
-def database_updated(db_path: Path = DEFAULT_DB) -> datetime | None:
-    """When chat.db was last written, counting its write-ahead log.
-
-    Taken from file times, not from the message table: asking the database for
-    its newest message would read across every thread on the machine, which
-    nothing here does. New rows land in chat.db-wal first and the main file can
-    lag it for hours, so the newer of the two is the answer.
-    """
-    times = [
-        p.stat().st_mtime
-        for p in (db_path, db_path.with_name(db_path.name + "-wal"))
-        if p.exists()
-    ]
-    if not times:
-        return None
-    return datetime.fromtimestamp(max(times), tz=timezone.utc)
 
 
 def _fmt(stamp: datetime) -> str:
@@ -626,20 +621,6 @@ def staleness_note(
     return None
 
 
-def chat_shape(chat_id: str, db_path: Path = DEFAULT_DB) -> tuple[str | None, int]:
-    """The chat's guid and participant count, for one identifier.
-
-    Answers two questions with one lookup: is this a group (count > 1), and
-    what does AppleScript need to address it (the guid, which carries the
-    service prefix). Returns (None, 0) for an identifier with no chat row.
-    """
-    if not chat_id:
-        raise ScopeError("chat_id is required")
-    with _connect(db_path) as conn:
-        row = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
-    return (row[0], row[1]) if row else (None, 0)
-
-
 @dataclass(frozen=True)
 class Delivery:
     """What became of a message after Messages accepted it.
@@ -663,39 +644,19 @@ class Delivery:
         return f"no delivery receipt{where}"
 
 
-def last_sent_rowid(chat_id: str, db_path: Path = DEFAULT_DB) -> int | None:
-    """The newest outgoing row in this thread, recorded before sending.
-
-    This floor is what makes the confirmation unambiguous: anything above it
-    in this chat is the message we just wrote, not an older one that happens
-    to sit at the end of the thread. None means the floor could not be read,
-    which is reported as unconfirmed rather than guessed at.
-    """
-    if not chat_id:
-        raise ScopeError("chat_id is required")
-    try:
-        with _connect(db_path) as conn:
-            row = conn.execute(LAST_SENT_ROWID_QUERY, (chat_id,)).fetchone()
-    except (FileNotFoundError, PermissionError, sqlite3.Error):
-        return None
-    return row[0] if row and row[0] is not None else 0
-
-
 def confirm_delivery(
+    store: ChatStore,
     chat_id: str,
     after_rowid: int | None,
-    db_path: Path = DEFAULT_DB,
     *,
     timeout: float = 10.0,
     interval: float = 0.25,
 ) -> Delivery:
     """Watch the row this send produced until it settles or time runs out.
 
-    Sending still never resolves a target through chat.db: the identifier is
-    the caller's, exactly as before. This reads back only the row the send
-    just created, which is the one thing osascript cannot report. A failure
-    arrives on the row within a second or two; a receipt may never arrive at
-    all, which is why waiting is bounded and a timeout is not an error.
+    A failure arrives on the row within a second or two; a receipt may never
+    arrive at all, which is why waiting is bounded and a timeout is not an
+    error.
     """
     if after_rowid is None:
         return Delivery("unconfirmed", None)
@@ -704,32 +665,16 @@ def confirm_delivery(
     service = None
     while True:
         try:
-            with _connect(db_path) as conn:
-                row = conn.execute(DELIVERY_QUERY, (chat_id, after_rowid)).fetchone()
-        except (FileNotFoundError, PermissionError, sqlite3.Error):
+            seen = store.sent_after(chat_id, after_rowid)
+        except StoreError:
             return Delivery("unconfirmed", service)
-        if row is not None:
-            service = row["service"] or service
-            if row["error"]:
-                return Delivery("failed", service, row["error"])
-            if row["is_delivered"]:
-                return Delivery("delivered", service)
+        if seen is not None:
+            if seen.status != "unconfirmed":
+                return seen
+            service = seen.service or service
         if time.monotonic() >= deadline:
             return Delivery("unconfirmed", service)
         time.sleep(interval)
-
-
-def find_groups(handle: str, db_path: Path = DEFAULT_DB) -> list[tuple[str, str | None, int]]:
-    """Group chats that one known handle is in, as (identifier, name, size).
-
-    Deliberately takes a participant rather than listing everything: a group
-    identifier cannot be guessed, so something has to hand it to you, but that
-    something should not be a dump of every conversation on the machine.
-    """
-    if not handle:
-        raise ScopeError("a participant is required")
-    with _connect(db_path) as conn:
-        return [tuple(r) for r in conn.execute(FIND_GROUPS_QUERY, (handle,)).fetchall()]
 
 
 def _attachments_for(conn, message_ids: list[int]) -> dict[int, list[Attachment]]:
@@ -752,54 +697,156 @@ def _attachments_for(conn, message_ids: list[int]) -> dict[int, list[Attachment]
     return out
 
 
-def read_thread(
-    chat_id: str,
-    limit: int = 50,
-    db_path: Path = DEFAULT_DB,
-    include_empty: bool = False,
-    labels: dict[str, str] | None = None,
-) -> list[Message]:
-    """Read the most recent messages for one chat identifier, newest first.
+@dataclass(frozen=True)
+class Chat:
+    """What one chat identifier refers to, and how Messages can reach it.
 
-    `chat_id` is required and is always bound as a parameter -- there is no
-    code path that reads across threads.
-
-    Senders are attached only when the thread has more than one participant.
-    `labels` maps a handle to a name you already use for them, so a group
-    transcript reads in contact names rather than phone numbers.
+    `guid` carries the service prefix AppleScript needs ("iMessage;+;chat...",
+    "any;-;+1555..."); None means there is no addressable row. A chat with no
+    row at all is a first message to one person, not a group.
     """
-    if not chat_id:
-        raise ScopeError("chat_id is required")
 
-    with _connect(db_path) as conn:
-        rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
-        shape = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
-        files = _attachments_for(conn, [r[0] for r in rows])
+    identifier: str
+    guid: str | None
+    participants: int
 
-    is_group = bool(shape and shape[1] > 1)
-    labels = labels or {}
+    @property
+    def is_group(self) -> bool:
+        return self.participants > 1
 
-    out: list[Message] = []
-    for rowid, raw_date, is_from_me, text, blob, has_attachment, handle in rows:
-        body = text if text else decode_attributed_body(blob)
-        if not include_empty and not (body and body.strip()) and not has_attachment:
-            continue
-        stamp = apple_time(raw_date)
-        out.append(
-            Message(
-                date=stamp.isoformat() if stamp else None,
-                from_me=bool(is_from_me),
-                text=body,
-                has_attachment=bool(has_attachment) or bool(files.get(rowid)),
-                attachments=files.get(rowid, []),
-                sender=(
-                    labels.get(handle) or mask_handle(handle)
-                    if is_group and not is_from_me
-                    else None
-                ),
+
+def _chat(conn, chat_id: str) -> Chat:
+    row = conn.execute(CHAT_SHAPE_QUERY, (chat_id,)).fetchone()
+    return Chat(chat_id, row[0], row[1]) if row else Chat(chat_id, None, 0)
+
+
+class ChatStore:
+    """chat.db, opened read-only, one chat identifier per question.
+
+    The only module that touches the database. It takes a path and has no
+    default on purpose: the real chat.db holds every conversation on the
+    machine, so reaching it has to be something a caller chose, never
+    something a test fell into by forgetting an argument.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def last_sent_rowid(self, chat_id: str) -> int:
+        """The newest outgoing row in this thread, recorded before sending.
+
+        This floor is what makes a confirmation unambiguous: anything above it
+        in this chat is the message just written, not an older one that happens
+        to sit at the end of the thread.
+        """
+        if not chat_id:
+            raise ScopeError("chat_id is required")
+        with _connect(self.path) as conn:
+            row = conn.execute(LAST_SENT_ROWID_QUERY, (chat_id,)).fetchone()
+        return row[0] if row and row[0] is not None else 0
+
+    def sent_after(self, chat_id: str, floor: int) -> Delivery | None:
+        """The outgoing row this chat gained above `floor`, or None yet.
+
+        Reads back only the row a send just created, which is the one thing
+        osascript cannot report.
+        """
+        if not chat_id:
+            raise ScopeError("chat_id is required")
+        with _connect(self.path) as conn:
+            row = conn.execute(DELIVERY_QUERY, (chat_id, floor)).fetchone()
+        if row is None:
+            return None
+        if row["error"]:
+            return Delivery("failed", row["service"], row["error"])
+        if row["is_delivered"]:
+            return Delivery("delivered", row["service"])
+        return Delivery("unconfirmed", row["service"])
+
+    def updated(self) -> datetime | None:
+        """When chat.db was last written, counting its write-ahead log.
+
+        Taken from file times, not from the message table: asking the database
+        for its newest message would read across every thread on the machine,
+        which nothing here does. New rows land in chat.db-wal first and the
+        main file can lag it for hours, so the newer of the two is the answer.
+        """
+        times = [
+            p.stat().st_mtime
+            for p in (self.path, self.path.with_name(self.path.name + "-wal"))
+            if p.exists()
+        ]
+        if not times:
+            return None
+        return datetime.fromtimestamp(max(times), tz=timezone.utc)
+
+    def find_groups(self, handle: str) -> list[tuple[str, str | None, int]]:
+        """Group chats that one known handle is in, as (identifier, name, size).
+
+        Deliberately takes a participant rather than listing everything: a
+        group identifier cannot be guessed, so something has to hand it to
+        you, but that something should not be a dump of every conversation on
+        the machine.
+        """
+        if not handle:
+            raise ScopeError("a participant is required")
+        with _connect(self.path) as conn:
+            return [tuple(r) for r in conn.execute(FIND_GROUPS_QUERY, (handle,)).fetchall()]
+
+    def chat(self, chat_id: str) -> Chat:
+        """Whether this identifier is a group, and its guid, in one lookup."""
+        if not chat_id:
+            raise ScopeError("chat_id is required")
+        with _connect(self.path) as conn:
+            return _chat(conn, chat_id)
+
+    def read_thread(
+        self,
+        chat_id: str,
+        limit: int = 50,
+        include_empty: bool = False,
+        labels: dict[str, str] | None = None,
+    ) -> list[Message]:
+        """Read the most recent messages for one chat identifier, newest first.
+
+        `chat_id` is required and is always bound as a parameter -- there is no
+        code path that reads across threads.
+
+        Senders are attached only when the thread has more than one participant.
+        `labels` maps a handle to a name you already use for them, so a group
+        transcript reads in contact names rather than phone numbers.
+        """
+        if not chat_id:
+            raise ScopeError("chat_id is required")
+
+        with _connect(self.path) as conn:
+            rows = conn.execute(QUERY, (chat_id, limit)).fetchall()
+            is_group = _chat(conn, chat_id).is_group
+            files = _attachments_for(conn, [r[0] for r in rows])
+
+        labels = labels or {}
+
+        out: list[Message] = []
+        for rowid, raw_date, is_from_me, text, blob, has_attachment, handle in rows:
+            body = text if text else decode_attributed_body(blob)
+            if not include_empty and not (body and body.strip()) and not has_attachment:
+                continue
+            stamp = apple_time(raw_date)
+            out.append(
+                Message(
+                    date=stamp.isoformat() if stamp else None,
+                    from_me=bool(is_from_me),
+                    text=body,
+                    has_attachment=bool(has_attachment) or bool(files.get(rowid)),
+                    attachments=files.get(rowid, []),
+                    sender=(
+                        labels.get(handle) or mask_handle(handle)
+                        if is_group and not is_from_me
+                        else None
+                    ),
+                )
             )
-        )
-    return out
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -864,65 +911,104 @@ def _osascript(script: str, *args: str) -> None:
         raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
 
 
-def _send_via(
-    script: str, fallback: str, payload: str, target: str, identifier: str
-) -> None:
-    """Run a send, and reroute it only when the chat itself is unreachable.
+class Unaddressable(RuntimeError):
+    """Messages will not address this chat (AppleScript error -1728)."""
 
-    The participant path can only reach iMessage, which is why it is never the
-    default. But when the chat cannot be addressed at all, iMessage is the
-    difference between delivering and not. Any other AppleScript error is a
-    real failure and is raised rather than retried down a different route.
+
+class MessagesTransport:
+    """Sends through Messages.app with osascript: the adapter `send` uses for
+    real. Tests use a fake that writes the row Messages would write.
+
+    Raises Unaddressable for -1728 so `send` can decide whether a fallback is
+    safe; every other AppleScript failure is a plain RuntimeError.
     """
-    try:
-        _osascript(script, payload, target)
-    except RuntimeError as exc:
-        if script is fallback or UNADDRESSABLE_CHAT not in str(exc):
+
+    def to_chat(self, guid: str, body_path: str) -> None:
+        try:
+            _osascript(CHAT_SEND_SCRIPT, body_path, guid)
+        except RuntimeError as exc:
+            if UNADDRESSABLE_CHAT in str(exc):
+                raise Unaddressable(str(exc)) from exc
             raise
-        _osascript(fallback, payload, identifier)
+
+    def to_participant(self, handle: str, body_path: str) -> None:
+        _osascript(SEND_SCRIPT, body_path, handle)
 
 
-def send_message(
-    chat: str | None,
+# The adapter the command line sends through. Module-level so tests can swap
+# in a fake at this seam instead of stubbing the functions behind it.
+TRANSPORT = MessagesTransport()
+
+
+def send(
+    store: ChatStore,
+    transport,
+    chat_id: str,
     text: str,
     *,
     robot: bool,
-    guid: str | None = None,
-) -> None:
-    """Send one iMessage to one chat identifier.
+    timeout: float = 10.0,
+    interval: float = 0.25,
+) -> Delivery:
+    """Send one message to one chat and report what became of it.
 
-    Scoped the same way reads are: no identifier, no send. There is no
-    broadcast path and no "reply to whoever was last" convenience.
+    Scoped the same way reads are: one identifier, no broadcast path, no
+    "reply to whoever was last". Everything that has to happen in order lives
+    here so no caller can get it wrong:
 
-    `guid` addresses an existing chat, group or one-to-one, and is used
-    whenever there is one: it carries that thread's own service, so an SMS or
-    RCS conversation is not silently addressed over iMessage. It is passed in
-    rather than looked up here so that sending still never touches chat.db.
-    Without a guid this addresses a single participant over iMessage, which is
-    correct only for a first message to someone with no chat row yet.
+    - refuse an empty target or body before anything else;
+    - look the chat up, and refuse a group Messages cannot address;
+    - record the floor (the newest outgoing row) before sending, so the row
+      read back afterwards is certainly this send's;
+    - address an existing chat by its guid, which carries its own service, so
+      an SMS or RCS thread is not silently sent over iMessage;
+    - fall back to the participant on -1728 only for a one-to-one chat -- for
+      a group that route would reach one person, not the group;
+    - wait, bounded, for the row to report delivered, failed, or nothing.
 
-    The body goes via a UTF-8 file rather than inline in the AppleScript.
-    Inline quoting mangles apostrophes and emoji, and the agent marker is an
-    emoji, so this is not optional.
+    The body goes via a UTF-8 file: inline AppleScript quoting mangles
+    apostrophes and emoji, and the agent marker is an emoji.
     """
-    identifier = (chat or "").strip()
+    identifier = (chat_id or "").strip()
     if not identifier:
         raise ScopeError("a chat identifier is required to send")
-
-    script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
-
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
         raise ValueError("refusing to send an empty message")
 
+    chat = store.chat(identifier)
+    if chat.is_group and not chat.guid:
+        raise ScopeError(
+            f"{identifier} is a group chat with no addressable id; "
+            "refusing to fall back to a single participant"
+        )
+    try:
+        floor = store.last_sent_rowid(identifier)
+    except StoreError:
+        floor = None
+
     with NamedTemporaryFile("w", suffix=".txt", encoding="utf-8", delete=False) as handle:
         handle.write(body)
         body_path = handle.name
-
     try:
-        _send_via(script, SEND_SCRIPT, body_path, target, identifier)
+        if chat.guid:
+            try:
+                transport.to_chat(chat.guid, body_path)
+            except Unaddressable as exc:
+                # The participant route reaches one person over iMessage. For a
+                # one-to-one chat that is the same person; for a group it is not.
+                if chat.is_group:
+                    raise Unaddressable(
+                        f"{identifier} is a group chat Messages will not address; "
+                        "refusing to fall back to a single participant"
+                    ) from exc
+                transport.to_participant(identifier, body_path)
+        else:
+            transport.to_participant(identifier, body_path)
     finally:
         os.unlink(body_path)
+
+    return confirm_delivery(store, identifier, floor, timeout=timeout, interval=interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1107,8 +1193,8 @@ def _run_find_groups(args: argparse.Namespace) -> int:
     """
     try:
         handle = resolve_chat(args.chat, args.contact, args.contacts_file)
-        groups = find_groups(handle, args.db)
-    except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
+        groups = ChatStore(args.db).find_groups(handle)
+    except (ScopeError, ConfigError, StoreError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -1134,37 +1220,25 @@ def _run_send(args: argparse.Namespace) -> int:
             if args.message_file is not None
             else (args.message or "")
         )
-        # A chat with no row yet is a first message to that person, not a
-        # group: participants is 0 and the one-to-one path is correct.
-        guid, participants = chat_shape(chat_id, args.db)
-    except (ScopeError, ConfigError, FileNotFoundError) as exc:
+    except (ScopeError, ConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    if participants > 1 and not guid:
-        print(
-            f"error: {chat_id} is a group chat with no addressable id; "
-            "refusing to fall back to a single participant",
-            file=sys.stderr,
-        )
         return 1
 
     robot = _resolve_marker_choice(args.robot, configured)
     if robot is None:
         return 1
 
-    # Recorded before the send so the row read back afterwards is certainly
-    # the one this call produced.
-    floor = last_sent_rowid(chat_id, args.db)
-
     try:
-        send_message(chat_id, text, robot=robot, guid=guid)
+        delivery = send(ChatStore(args.db), TRANSPORT, chat_id, text,
+                        robot=robot, timeout=args.confirm_timeout)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    delivery = confirm_delivery(chat_id, floor, args.db, timeout=args.confirm_timeout)
-    marked = f"{chat_id}{' ' + AGENT_MARKER if robot else ''}"
+    # The confirmation names who it went to the way the caller did, so a
+    # --contact send never puts the number into a transcript.
+    who = args.contact or mask_handle(chat_id)
+    marked = f"{who}{' ' + AGENT_MARKER if robot else ''}"
     if delivery.status == "failed":
         print(f"error: sent to {marked} but {delivery.render()}", file=sys.stderr)
         return 1
@@ -1210,20 +1284,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
-        messages = read_thread(
+        store = ChatStore(args.db)
+        messages = store.read_thread(
             chat_id,
             limit=args.limit,
-            db_path=args.db,
             include_empty=args.include_empty,
             labels=_sender_labels(args.contacts_file),
         )
-    except (ScopeError, ConfigError, FileNotFoundError, PermissionError) as exc:
+    except (ScopeError, ConfigError, StoreError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     # stderr, so JSON on stdout stays parseable and the note still reaches
     # whoever reads the output.
-    note = staleness_note(messages, database_updated(args.db))
+    note = staleness_note(messages, store.updated())
     if note:
         print(note, file=sys.stderr)
 
