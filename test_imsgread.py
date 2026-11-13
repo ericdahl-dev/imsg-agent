@@ -493,6 +493,28 @@ def test_contacts_file_flag_overrides_every_default(tmp_path, monkeypatch):
     assert imsgread.ContactBook.open(explicit).resolve(contact="friend").identifier == "+1888"
 
 
+@pytest.mark.parametrize("flag, env, expected", [
+    (True, True, "flag"),     # --contacts-file beats everything
+    (False, True, "env"),     # then $IMSG_AGENT_CONTACTS, even if missing
+    (False, False, "search"), # then the first file found, or where to create one
+])
+def test_one_choice_says_which_contacts_file_is_in_force_and_why(tmp_path, monkeypatch, flag, env, expected):
+    explicit = tmp_path / "explicit.toml"
+    named = tmp_path / "named-by-env.toml"  # never created: a set env var still wins
+    config = write_contacts(tmp_path / "config.toml", "friend", "+1555")
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+    if env:
+        monkeypatch.setenv(imsgread.CONTACTS_ENV, str(named))
+    else:
+        monkeypatch.delenv(imsgread.CONTACTS_ENV, raising=False)
+
+    chosen = imsgread.choose_contacts_file(explicit if flag else None)
+
+    assert chosen.origin == expected
+    assert chosen.path == {"flag": explicit, "env": named, "search": config}[expected]
+    assert config in chosen.searched
+
+
 def test_resolve_chat_honors_contacts_file_from_cli(tmp_path, messages, send_db):
     explicit = write_contacts(tmp_path / "explicit.toml", "friend", "+1888")
 

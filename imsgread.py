@@ -144,20 +144,53 @@ def contacts_candidates() -> list[Path]:
     return paths
 
 
-def contacts_path() -> Path:
-    """The contacts file in effect, or where to create one if none exists.
+@dataclass(frozen=True)
+class ContactsFile:
+    """The contacts.toml this run uses, and why that one.
 
-    A set $IMSG_AGENT_CONTACTS is the answer whether or not the file exists
-    yet: falling through to another file would put a different set of
-    contacts in force than the one the caller named.
+    origin is "flag" (--contacts-file), "env" ($IMSG_AGENT_CONTACTS) or
+    "search" (the first of `searched` that exists, else where to create one).
+    A named file -- flag or env -- is the answer whether or not it exists yet:
+    falling through to another file would put a different set of contacts in
+    force than the one the caller named.
     """
+
+    path: Path
+    origin: str
+    searched: tuple[Path, ...]
+
+    def load(self) -> dict[str, "Contact"]:
+        if self.origin == "env" and not self.path.exists():
+            raise ConfigError(
+                f"${CONTACTS_ENV} points to {self.path}, which does not exist"
+            )
+        return load_contact_entries(self.path)
+
+    def empty_hint(self) -> str:
+        """What to do when this file has no contacts."""
+        if self.path.exists():
+            return f"add contacts to {self.path}"
+        if self.origin != "search":
+            return f"create {self.path}"
+        searched = "\n  ".join(str(c) for c in self.searched)
+        return f"create {self.path}\nsearched:\n  {searched}"
+
+
+def choose_contacts_file(flag: Path | None = None) -> ContactsFile:
+    """The one place that decides which contacts.toml is in force."""
+    searched = tuple(contacts_candidates())
+    if flag is not None:
+        return ContactsFile(flag, "flag", searched)
     env = os.environ.get(CONTACTS_ENV)
     if env:
-        return Path(env).expanduser()
-    for candidate in contacts_candidates():
-        if candidate.exists():
-            return candidate
-    return CONFIG_CONTACTS
+        return ContactsFile(Path(env).expanduser(), "env", searched)
+    found = next((c for c in searched if c.exists()), CONFIG_CONTACTS)
+    return ContactsFile(found, "search", searched)
+
+
+def contacts_path() -> Path:
+    """The contacts file in effect, or where to create one if none exists."""
+    return choose_contacts_file().path
 
 
 @dataclass(frozen=True)
@@ -221,11 +254,7 @@ def _parse_contact(name: str, value: object) -> Contact:
 def load_contact_entries(path: Path | None = None) -> dict[str, Contact]:
     """Every contact with its settings."""
     if path is None:
-        path = contacts_path()
-        if os.environ.get(CONTACTS_ENV) and not path.exists():
-            raise ConfigError(
-                f"${CONTACTS_ENV} points to {path}, which does not exist"
-            )
+        return choose_contacts_file().load()
     if not path.exists():
         return {}
     with path.open("rb") as fh:
@@ -270,7 +299,8 @@ class ContactBook:
 
     @classmethod
     def open(cls, path: Path | None = None) -> "ContactBook":
-        return cls(load_contact_entries(path))
+        """The book from --contacts-file `path`, else the file in force."""
+        return cls(choose_contacts_file(path).load())
 
     def items(self) -> list[tuple[str, Contact]]:
         """Every contact, sorted by name."""
@@ -1197,7 +1227,7 @@ def _run_config(args: argparse.Namespace, terminal: Terminal) -> int:
         )
         return 1
 
-    path = args.contacts_file or contacts_path()
+    path = choose_contacts_file(args.contacts_file).path
     try:
         entries = load_contact_entries(path)
     except ConfigError as exc:
@@ -1342,24 +1372,16 @@ def main(argv: list[str] | None = None, terminal: Terminal | None = None) -> int
         return _run_config(args, terminal)
 
     if args.contacts:
+        # The hint names the file this run reads; pointing anywhere else
+        # sends someone to edit a file that is never used.
+        in_force = choose_contacts_file(args.contacts_file)
         try:
-            entries = ContactBook.open(args.contacts_file).items()
+            entries = ContactBook(in_force.load()).items()
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if not entries:
-            # Name the file actually in force: --contacts-file, then a set
-            # $IMSG_AGENT_CONTACTS, then the search. Pointing anywhere else
-            # sends someone to edit a file this run never reads.
-            in_force = args.contacts_file or contacts_path()
-            if in_force.exists():
-                hint = f"add contacts to {in_force}"
-            elif args.contacts_file or os.environ.get(CONTACTS_ENV):
-                hint = f"create {in_force}"
-            else:
-                searched = "\n  ".join(str(c) for c in contacts_candidates())
-                hint = f"create {in_force}\nsearched:\n  {searched}"
-            print(f"no contacts configured -- {hint}", file=sys.stderr)
+            print(f"no contacts configured -- {in_force.empty_hint()}", file=sys.stderr)
             return 1
         for name, contact in entries:
             # Only shown when set, so a contact with no standing decision reads
