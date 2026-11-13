@@ -1109,9 +1109,35 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+class Terminal:
+    """The person running the command, if there is one.
+
+    `interactive` is False when stdin is not a terminal -- the way an agent
+    runs. ask() returns None when there is no one to answer, including when
+    they end input (EOF or Ctrl-C), so a caller treats "no answer" one way.
+    """
+
+    @property
+    def interactive(self) -> bool:
+        return sys.stdin.isatty()
+
+    def ask(self, prompt: str) -> str | None:
+        if not self.interactive:
+            return None
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+
+TERMINAL = Terminal()
+
+
 def _resolve_marker_choice(
     robot: bool | None,
-    configured: bool | None = None,
+    configured: bool | None,
+    terminal: Terminal,
 ) -> bool | None:
     """Decide whether to mark, asking a human but never guessing for a program.
 
@@ -1129,14 +1155,14 @@ def _resolve_marker_choice(
         return robot
     if configured is not None:
         return configured
-    if not sys.stdin.isatty():
+    answer = terminal.ask(f"Mark this as sent by an agent ({AGENT_MARKER})? [Y/n] ")
+    if answer is None:
         print(
             "error: pass --robot or --no-robot when not running interactively",
             file=sys.stderr,
         )
         return None
-    answer = input(f"Mark this as sent by an agent ({AGENT_MARKER})? [Y/n] ").strip().lower()
-    return answer not in {"n", "no"}
+    return answer.strip().lower() not in {"n", "no"}
 
 
 CONFIG_COMMANDS = """commands:
@@ -1156,7 +1182,7 @@ def _print_config(path: Path, entries: dict[str, Contact]) -> None:
         print(f"  {name:<{width}}  {contact.identifier}  marker: {marker_word(contact.marker)}")
 
 
-def _run_config(args: argparse.Namespace) -> int:
+def _run_config(args: argparse.Namespace, terminal: Terminal) -> int:
     """Edit contacts.toml, but only for a person sitting at a terminal.
 
     A contact's marker setting is allowed to answer for a program that passed
@@ -1164,7 +1190,7 @@ def _run_config(args: argparse.Namespace) -> int:
     Refusing without a tty is what makes that true: an agent cannot give itself
     permission to send unmarked, because it cannot reach this code at all.
     """
-    if not sys.stdin.isatty():
+    if not terminal.interactive:
         print(
             "error: config changes must be made by a human at a terminal",
             file=sys.stderr,
@@ -1183,11 +1209,10 @@ def _run_config(args: argparse.Namespace) -> int:
     print(CONFIG_COMMANDS)
 
     while True:
-        try:
-            parts = input("> ").strip().split()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        line = terminal.ask("> ")
+        if line is None:
             return 0
+        parts = line.strip().split()
         if not parts:
             continue
         cmd, rest = parts[0].lower(), parts[1:]
@@ -1272,7 +1297,7 @@ def _run_find_groups(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_send(args: argparse.Namespace) -> int:
+def _run_send(args: argparse.Namespace, terminal: Terminal) -> int:
     if args.message is None and args.message_file is None:
         print("error: --send needs --message or --message-file", file=sys.stderr)
         return 1
@@ -1288,7 +1313,7 @@ def _run_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    robot = _resolve_marker_choice(args.robot, recipient.marker)
+    robot = _resolve_marker_choice(args.robot, recipient.marker, terminal)
     if robot is None:
         return 1
 
@@ -1309,11 +1334,12 @@ def _run_send(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, terminal: Terminal | None = None) -> int:
     args = build_parser().parse_args(argv)
+    terminal = terminal or TERMINAL
 
     if args.config:
-        return _run_config(args)
+        return _run_config(args, terminal)
 
     if args.contacts:
         try:
@@ -1349,7 +1375,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_find_groups(args)
 
     if args.send:
-        return _run_send(args)
+        return _run_send(args, terminal)
 
     try:
         book = _open_book(args)
