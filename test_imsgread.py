@@ -1487,3 +1487,92 @@ def test_an_empty_listing_names_the_env_var_file(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert str(empty) in err
     assert "config.toml" not in err
+
+
+@pytest.mark.parametrize("named, searched_listed", [(True, False), (False, True)])
+def test_a_missing_contacts_file_says_create_it(tmp_path, monkeypatch, capsys, named, searched_listed):
+    """A named file is the one to create; only a search lists where it looked."""
+    missing = tmp_path / "missing.toml"
+    monkeypatch.delenv(imsgread.CONTACTS_ENV, raising=False)
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", missing)
+    monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", tmp_path / "absent.toml")
+
+    argv = ["--contacts", "--contacts-file", str(missing)] if named else ["--contacts"]
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert f"create {missing}" in err
+    assert ("searched:" in err) is searched_listed
+
+
+def test_contacts_listing_reports_an_env_file_that_does_not_exist(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(imsgread.CONTACTS_ENV, str(tmp_path / "gone.toml"))
+
+    assert main(["--contacts"]) == 1
+    assert "does not exist" in capsys.readouterr().err
+
+
+# --- CLI error exits -----------------------------------------------------------
+
+def test_send_without_a_body_is_refused(messages, send_db, capsys):
+    assert main(["--send", "--chat", "+15555550123", "--robot", "--db", str(send_db)]) == 1
+    assert "--message" in capsys.readouterr().err
+    assert messages.calls == []
+
+
+def test_send_to_an_unknown_contact_is_refused(tmp_path, messages, send_db, capsys):
+    cfg = write_contacts(tmp_path / "c.toml", "friend", "+1555")
+
+    assert main(["--send", "--contact", "nobody", "--message", "hi", "--robot",
+                 "--contacts-file", str(cfg), "--db", str(send_db)]) == 1
+    err = capsys.readouterr().err
+    assert "nobody" in err
+    assert "+1555" not in err
+    assert messages.calls == []
+
+
+def test_find_groups_says_so_when_there_are_none(tmp_path, capsys, db):
+    cfg = write_contacts(tmp_path / "c.toml", "loner", "+15555550000")
+
+    assert main(["--find-groups", "--contact", "loner",
+                 "--contacts-file", str(cfg), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "no group chats" in captured.err
+    assert captured.out == ""
+
+
+def test_reading_without_access_to_chat_db_is_one_clean_error(tmp_path, capsys):
+    assert main(["--chat", "+15555550123", "--db", str(tmp_path / "missing.db")]) == 1
+    assert capsys.readouterr().err.startswith("error:")
+
+
+# --- --config, driven through the terminal seam --------------------------------
+
+def test_config_mode_reports_a_broken_contacts_file(tmp_path, capsys):
+    cfg = write_toml(tmp_path / "c.toml", "[contacts\n")
+
+    assert main(["--config", "--contacts-file", str(cfg)], terminal=FakeTerminal(["quit"])) == 1
+    assert "not valid TOML" in capsys.readouterr().err
+
+
+def test_config_mode_walks_an_empty_book_to_a_first_contact(tmp_path, capsys):
+    cfg = tmp_path / "new" / "contacts.toml"
+    terminal = FakeTerminal(["", "help", "list", "add friend", "set friend", "add friend +1555", "list"])
+
+    # replies run out = the person pressed Ctrl-D, which ends the session cleanly
+    assert main(["--config", "--contacts-file", str(cfg)], terminal=terminal) == 0
+    out = capsys.readouterr().out
+    assert "(none configured)" in out
+    assert out.count("commands:") == 2          # banner, then help
+    assert "usage: add NAME IDENTIFIER" in out
+    assert "usage: set NAME marker" in out
+    assert "friend -> +1555  marker: ask" in out
+    assert imsgread.load_contact_entries(cfg)["friend"] == imsgread.Contact("+1555", None)
+
+
+def test_config_mode_reports_a_write_it_refused_and_keeps_going(tmp_path, capsys):
+    cfg = write_contacts(tmp_path / "c.toml", "friend", "+1555")
+
+    assert main(["--config", "--contacts-file", str(cfg)],
+                terminal=FakeTerminal(["add bad.name +1666", "set friend marker never", "quit"])) == 0
+    assert "error: contact name 'bad.name'" in capsys.readouterr().out
+    assert imsgread.load_contact_entries(cfg)["friend"].marker is False
