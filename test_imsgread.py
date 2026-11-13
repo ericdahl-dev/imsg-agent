@@ -1418,7 +1418,7 @@ def test_an_empty_listing_names_the_contacts_file_given(tmp_path, monkeypatch, c
 
     assert main(["--contacts", "--contacts-file", str(empty)]) == 1
     err = capsys.readouterr().err
-    assert f"create {empty}" in err or f"add contacts to {empty}" in err
+    assert f"add contacts to {empty}" in err
     assert "config.toml" not in err
 
 
