@@ -7,7 +7,7 @@ description: Read or send iMessages and texts on macOS. Use when the user wants 
 
 Use this skill when you need to read or send iMessages from Claude Code on a Mac where imsg-agent is installed.
 
-The commands below call the installed `imsg-agent` executable, so they work from any working directory. If the shell reports `command not found: imsg-agent`, it is not installed yet -- run `pip install -e .` (or `uv tool install -e .`, or `pipx install -e .`) inside the imsg-agent checkout, then retry. Do not substitute a path to `imsgread.py` guessed from the current directory.
+The commands below call the installed `imsg-agent` executable, so they work from any working directory. If the shell reports `command not found: imsg-agent`, it is not installed yet -- follow the Install section of the imsg-agent README (a venv plus a link into `~/.local/bin`, or `pipx install -e .` / `uv tool install -e .`); a bare `pip install` fails on Homebrew Python. Then retry. Do not substitute a path to `imsgread.py` guessed from the current directory.
 
 `imsg-agent` is the supported path for iMessage work. Do not query `~/Library/Messages/chat.db` directly, do not reimplement the typedstream decoder, and do not write ad-hoc AppleScript that embeds phone numbers in commands or transcripts.
 
