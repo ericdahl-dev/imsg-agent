@@ -1276,3 +1276,29 @@ def test_a_raw_number_send_reports_it_masked(messages, send_db, capsys):
     assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--no-robot",
                  "--confirm-timeout", "0", "--db", str(send_db)]) == 0
     assert capsys.readouterr().err.startswith("sent to *0123 (")
+
+
+# --- $IMSG_AGENT_CONTACTS is a promise, not a hint ------------------------------
+
+def test_a_contacts_env_var_pointing_nowhere_is_an_error(tmp_path, monkeypatch):
+    """A typo in the override used to fall through to another file, so the
+    caller believed one set of contacts was in force while another was."""
+    config = write_contacts(tmp_path / "config.toml", "friend", "+1777")
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+    monkeypatch.setenv("IMSG_AGENT_CONTACTS", str(tmp_path / "typo.toml"))
+
+    with pytest.raises(imsgread.ConfigError, match="IMSG_AGENT_CONTACTS"):
+        imsgread.load_contacts()
+
+
+def test_writing_a_contact_goes_where_the_env_var_points(tmp_path, monkeypatch):
+    """--config used to write to the config dir while reads used the override."""
+    config = tmp_path / "config.toml"
+    monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
+    override = tmp_path / "override.toml"
+    monkeypatch.setenv("IMSG_AGENT_CONTACTS", str(override))
+
+    imsgread.write_contact("friend", imsgread.Contact("+1888", None))
+
+    assert imsgread.load_contacts() == {"friend": "+1888"}
+    assert override.exists() and not config.exists()
