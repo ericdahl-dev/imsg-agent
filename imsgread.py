@@ -1233,7 +1233,10 @@ def _run_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    marked = f"{chat_id}{' ' + AGENT_MARKER if robot else ''}"
+    # The confirmation names who it went to the way the caller did, so a
+    # --contact send never puts the number into a transcript.
+    who = args.contact or mask_handle(chat_id)
+    marked = f"{who}{' ' + AGENT_MARKER if robot else ''}"
     if delivery.status == "failed":
         print(f"error: sent to {marked} but {delivery.render()}", file=sys.stderr)
         return 1

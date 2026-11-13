@@ -1232,3 +1232,23 @@ def test_any_other_applescript_failure_is_a_plain_error(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError) as exc:
         imsgread.MessagesTransport().to_chat("any;-;+1555", str(tmp_path / "b.txt"))
     assert not isinstance(exc.value, imsgread.Unaddressable)
+
+
+# --- what a send reports -------------------------------------------------------
+
+def test_a_send_reports_the_contact_name_not_the_number(tmp_path, messages, send_db, capsys):
+    """--contact exists to keep numbers out of transcripts; the confirmation
+    line was printing the number anyway."""
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\neric = { id = "+15555550123", marker = false }\n')
+
+    assert main(send_args(cfg, send_db)) == 0
+    err = capsys.readouterr().err
+    assert "+15555550123" not in err
+    assert err.startswith("sent to eric (")
+
+
+def test_a_raw_number_send_reports_it_masked(messages, send_db, capsys):
+    assert main(["--send", "--chat", "+15555550123", "--message", "hi", "--no-robot",
+                 "--confirm-timeout", "0", "--db", str(send_db)]) == 0
+    assert capsys.readouterr().err.startswith("sent to *0123 (")
