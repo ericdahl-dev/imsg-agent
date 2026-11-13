@@ -138,9 +138,9 @@ def test_apple_time_of_zero_is_none():
 # scoping -- the safety property
 # --------------------------------------------------------------------------
 
-def test_read_thread_refuses_empty_chat_id():
+def test_read_refuses_empty_chat_id():
     with pytest.raises(ScopeError):
-        imsgread.ChatStore(Path("/nonexistent")).read_thread("")
+        imsgread.ChatStore(Path("/nonexistent")).read("").messages
 
 
 # --------------------------------------------------------------------------
@@ -208,42 +208,42 @@ def db(tmp_path: Path) -> Path:
 
 
 def test_reads_only_the_requested_thread(db):
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     assert all("OTHER THREAD" != (m.text or "") for m in msgs)
     assert len(msgs) == 3  # empty row dropped, attachment kept
 
 
 def test_prefers_text_column_then_falls_back_to_blob(db):
-    msgs = {m.text for m in imsgread.ChatStore(db).read_thread("+15555550123")}
+    msgs = {m.text for m in imsgread.ChatStore(db).read("+15555550123").messages}
     assert "plain text column wins" in msgs
     assert "first from them" in msgs
 
 
 def test_newest_first(db):
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     assert msgs[0].has_attachment is True          # rowid 3 is newest surviving
 
 
 def test_returns_both_sides_of_the_conversation(db):
     """Both directions must come back. Reading only the other side loses what
     you already said -- and therefore what is still unanswered."""
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     assert any(m.from_me for m in msgs), "lost the sent side"
     assert any(not m.from_me for m in msgs), "lost the received side"
 
 
 def test_direction_is_not_inverted(db):
     """rowid 2 is the only is_from_me=1 row in the fixture."""
-    sent = [m for m in imsgread.ChatStore(db).read_thread("+15555550123") if m.from_me]
+    sent = [m for m in imsgread.ChatStore(db).read("+15555550123").messages if m.from_me]
     assert [m.text for m in sent] == ["plain text column wins"]
 
 
 def test_include_empty_keeps_bodyless_rows(db):
-    assert len(imsgread.ChatStore(db).read_thread("+15555550123", include_empty=True)) == 4
+    assert len(imsgread.ChatStore(db).read("+15555550123", include_empty=True).messages) == 4
 
 
 def test_limit_is_applied(db):
-    assert len(imsgread.ChatStore(db).read_thread("+15555550123", limit=1)) <= 1
+    assert len(imsgread.ChatStore(db).read("+15555550123", limit=1).messages) <= 1
 
 
 def test_render_is_readable():
@@ -254,7 +254,7 @@ def test_render_is_readable():
 def test_a_group_thread_attributes_each_sender(db):
     """Collapsing a group into one word makes the transcript quotable but
     misattributable, which is worse than not reading it at all."""
-    msgs = imsgread.ChatStore(db).read_thread("chat9001")
+    msgs = imsgread.ChatStore(db).read("chat9001").messages
     said = {m.sender: m.text for m in msgs if not m.from_me}
     assert len(said) == 2, said
     assert set(said.values()) == {"from alice", "from carol"}
@@ -263,7 +263,7 @@ def test_a_group_thread_attributes_each_sender(db):
 
 def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
     """The whole point of contacts.toml is that numbers stay out of output."""
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     assert all(m.sender is None for m in msgs)
     rendered = "\n".join(m.render() for m in msgs)
     assert "+15555550123" not in rendered
@@ -271,8 +271,8 @@ def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
 
 
 def test_group_senders_use_a_known_name_and_mask_the_rest(db):
-    msgs = imsgread.ChatStore(db).read_thread("chat9001",
-                       name_for=imsgread.ContactBook({"alice": imsgread.Contact("+15555550123")}).label)
+    msgs = imsgread.ChatStore(db).read("chat9001",
+                       name_for=imsgread.ContactBook({"alice": imsgread.Contact("+15555550123")}).label).messages
     senders = {m.sender for m in msgs if not m.from_me}
     assert "alice" in senders
     assert "*1111" in senders          # unnamed participant, masked
@@ -282,7 +282,7 @@ def test_group_senders_use_a_known_name_and_mask_the_rest(db):
 def test_an_attachment_reports_its_type_size_and_path(db):
     """[attachment] says something arrived but not what. Type, size and path
     are what make a transcript actionable."""
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     shot = next(m for m in msgs if m.has_attachment)
     kept = next(a for a in shot.attachments if a.exists)
 
@@ -297,7 +297,7 @@ def test_an_attachment_reports_its_type_size_and_path(db):
 def test_an_attachment_no_longer_on_disk_is_marked_missing(db):
     """About one in eight recent attachments is already gone; a read must
     treat that as normal rather than as an error."""
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     shot = next(m for m in msgs if m.has_attachment)
     gone = next(a for a in shot.attachments if not a.exists)
 
@@ -306,7 +306,7 @@ def test_an_attachment_no_longer_on_disk_is_marked_missing(db):
 
 
 def test_a_message_without_an_attachment_is_unchanged(db):
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     plain = next(m for m in msgs if m.text == "plain text column wins")
     assert plain.attachments == []
     assert plain.render().endswith("plain text column wins")
@@ -905,7 +905,7 @@ def test_link_previews_are_not_reported_as_attachments(db):
     """Messages writes a pluginPayloadAttachment per URL. They cannot be
     opened or forwarded and the link is already in the message text, so
     listing them buries the real files under path noise."""
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     shot = next(m for m in msgs if m.has_attachment)
 
     assert len(shot.attachments) == 2
@@ -984,8 +984,34 @@ def test_a_thread_warns_only_once_it_trails_by_more_than_a_day(hours_behind, war
 # --------------------------------------------------------------------------
 
 def test_the_store_reads_one_thread(db):
-    msgs = imsgread.ChatStore(db).read_thread("+15555550123")
+    msgs = imsgread.ChatStore(db).read("+15555550123").messages
     assert {m.text for m in msgs} == {"plain text column wins", "first from them", None}
+
+
+def test_a_transcript_carries_its_own_staleness_note(db):
+    """A caller cannot read a thread and forget to say it may be incomplete."""
+    import os
+    days_ago = datetime(2026, 11, 10, 18, 15, tzinfo=timezone.utc).timestamp()
+    os.utime(db, (days_ago, days_ago))
+
+    transcript = imsgread.ChatStore(db).read("+15555550123", now=NOW)
+
+    assert {m.text for m in transcript.messages} == {"plain text column wins", "first from them", None}
+    assert transcript.note.startswith("note: chat.db has not been updated since 2026-11-10")
+
+
+def test_a_transcript_renders_as_json_or_text_newest_or_oldest_first():
+    older = imsgread.Message(date="2026-11-12T09:00:00+00:00", from_me=False,
+                             text="older", has_attachment=False)
+    newer = imsgread.Message(date="2026-11-12T10:00:00+00:00", from_me=True,
+                             text="newer", has_attachment=False)
+    transcript = imsgread.Transcript([newer, older])
+
+    assert [m["text"] for m in json.loads(transcript.render())] == ["newer", "older"]
+    assert [m["text"] for m in json.loads(transcript.render(oldest_first=True))] == ["older", "newer"]
+    lines = transcript.render(text=True, oldest_first=True).splitlines()
+    assert lines == [older.render(), newer.render()]
+    assert transcript.messages == [newer, older]  # rendering never reorders the transcript
 
 
 @pytest.mark.parametrize("make", [
@@ -997,7 +1023,7 @@ def test_every_database_failure_is_one_store_error(tmp_path, make):
     path = tmp_path / "chat.db"
     make(path)
     with pytest.raises(imsgread.StoreError):
-        imsgread.ChatStore(path).read_thread("+15555550123")
+        imsgread.ChatStore(path).read("+15555550123").messages
 
 
 @pytest.mark.parametrize("chat_id, guid, is_group", [

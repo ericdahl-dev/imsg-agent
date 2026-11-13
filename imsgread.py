@@ -689,6 +689,22 @@ def staleness_note(
 
 
 @dataclass(frozen=True)
+class Transcript:
+    """One thread as read: messages newest first, and a note (or None) saying
+    why the result may not be the whole story."""
+
+    messages: list[Message]
+    note: str | None = None
+
+    def render(self, text: bool = False, oldest_first: bool = False) -> str:
+        """JSON (the default, for programs) or one line per message."""
+        ordered = self.messages[::-1] if oldest_first else self.messages
+        if text:
+            return "\n".join(m.render() for m in ordered)
+        return json.dumps([asdict(m) for m in ordered], indent=2)
+
+
+@dataclass(frozen=True)
 class Delivery:
     """What became of a message after Messages accepted it.
 
@@ -867,14 +883,16 @@ class ChatStore:
         with _connect(self.path) as conn:
             return _chat(conn, chat_id)
 
-    def read_thread(
+    def read(
         self,
         chat_id: str,
         limit: int = 50,
         include_empty: bool = False,
         name_for: Callable[[str], str] = mask_handle,
-    ) -> list[Message]:
-        """Read the most recent messages for one chat identifier, newest first.
+        now: datetime | None = None,
+    ) -> "Transcript":
+        """The most recent messages for one chat identifier, newest first,
+        with a note when they may be incomplete.
 
         `chat_id` is required and is always bound as a parameter -- there is no
         code path that reads across threads.
@@ -913,7 +931,7 @@ class ChatStore:
                     ),
                 )
             )
-        return out
+        return Transcript(out, staleness_note(out, self.updated(), now))
 
 
 # --------------------------------------------------------------------------
@@ -1403,7 +1421,7 @@ def main(argv: list[str] | None = None, terminal: Terminal | None = None) -> int
         book = _open_book(args)
         recipient = book.resolve(args.chat, args.contact)
         store = ChatStore(args.db)
-        messages = store.read_thread(
+        transcript = store.read(
             recipient.identifier,
             limit=args.limit,
             include_empty=args.include_empty,
@@ -1415,19 +1433,11 @@ def main(argv: list[str] | None = None, terminal: Terminal | None = None) -> int
 
     # stderr, so JSON on stdout stays parseable and the note still reaches
     # whoever reads the output.
-    note = staleness_note(messages, store.updated())
-    if note:
-        print(note, file=sys.stderr)
-
-    if args.oldest_first:
-        messages.reverse()
-
-    if args.text:
-        for m in messages:
-            print(m.render())
-    else:
-        json.dump([asdict(m) for m in messages], sys.stdout, indent=2)
-        sys.stdout.write("\n")
+    if transcript.note:
+        print(transcript.note, file=sys.stderr)
+    rendered = transcript.render(text=args.text, oldest_first=args.oldest_first)
+    if rendered:
+        print(rendered)
     return 0
 
 
