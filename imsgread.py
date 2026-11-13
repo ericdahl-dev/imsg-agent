@@ -909,65 +909,104 @@ def _osascript(script: str, *args: str) -> None:
         raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
 
 
-def _send_via(
-    script: str, fallback: str, payload: str, target: str, identifier: str
-) -> None:
-    """Run a send, and reroute it only when the chat itself is unreachable.
+class Unaddressable(RuntimeError):
+    """Messages will not address this chat (AppleScript error -1728)."""
 
-    The participant path can only reach iMessage, which is why it is never the
-    default. But when the chat cannot be addressed at all, iMessage is the
-    difference between delivering and not. Any other AppleScript error is a
-    real failure and is raised rather than retried down a different route.
+
+class MessagesTransport:
+    """Sends through Messages.app with osascript: the adapter `send` uses for
+    real. Tests use a fake that writes the row Messages would write.
+
+    Raises Unaddressable for -1728 so `send` can decide whether a fallback is
+    safe; every other AppleScript failure is a plain RuntimeError.
     """
-    try:
-        _osascript(script, payload, target)
-    except RuntimeError as exc:
-        if script is fallback or UNADDRESSABLE_CHAT not in str(exc):
+
+    def to_chat(self, guid: str, body_path: str) -> None:
+        try:
+            _osascript(CHAT_SEND_SCRIPT, body_path, guid)
+        except RuntimeError as exc:
+            if UNADDRESSABLE_CHAT in str(exc):
+                raise Unaddressable(str(exc)) from exc
             raise
-        _osascript(fallback, payload, identifier)
+
+    def to_participant(self, handle: str, body_path: str) -> None:
+        _osascript(SEND_SCRIPT, body_path, handle)
 
 
-def send_message(
-    chat: str | None,
+# The adapter the command line sends through. Module-level so tests can swap
+# in a fake at this seam instead of stubbing the functions behind it.
+TRANSPORT = MessagesTransport()
+
+
+def send(
+    store: ChatStore,
+    transport,
+    chat_id: str,
     text: str,
     *,
     robot: bool,
-    guid: str | None = None,
-) -> None:
-    """Send one iMessage to one chat identifier.
+    timeout: float = 10.0,
+    interval: float = 0.25,
+) -> Delivery:
+    """Send one message to one chat and report what became of it.
 
-    Scoped the same way reads are: no identifier, no send. There is no
-    broadcast path and no "reply to whoever was last" convenience.
+    Scoped the same way reads are: one identifier, no broadcast path, no
+    "reply to whoever was last". Everything that has to happen in order lives
+    here so no caller can get it wrong:
 
-    `guid` addresses an existing chat, group or one-to-one, and is used
-    whenever there is one: it carries that thread's own service, so an SMS or
-    RCS conversation is not silently addressed over iMessage. It is passed in
-    rather than looked up here so that sending still never touches chat.db.
-    Without a guid this addresses a single participant over iMessage, which is
-    correct only for a first message to someone with no chat row yet.
+    - refuse an empty target or body before anything else;
+    - look the chat up, and refuse a group Messages cannot address;
+    - record the floor (the newest outgoing row) before sending, so the row
+      read back afterwards is certainly this send's;
+    - address an existing chat by its guid, which carries its own service, so
+      an SMS or RCS thread is not silently sent over iMessage;
+    - fall back to the participant on -1728 only for a one-to-one chat -- for
+      a group that route would reach one person, not the group;
+    - wait, bounded, for the row to report delivered, failed, or nothing.
 
-    The body goes via a UTF-8 file rather than inline in the AppleScript.
-    Inline quoting mangles apostrophes and emoji, and the agent marker is an
-    emoji, so this is not optional.
+    The body goes via a UTF-8 file: inline AppleScript quoting mangles
+    apostrophes and emoji, and the agent marker is an emoji.
     """
-    identifier = (chat or "").strip()
+    identifier = (chat_id or "").strip()
     if not identifier:
         raise ScopeError("a chat identifier is required to send")
-
-    script, target = (CHAT_SEND_SCRIPT, guid) if guid else (SEND_SCRIPT, identifier)
-
     body = mark_agent_sent(text, robot=robot)
     if not body.strip():
         raise ValueError("refusing to send an empty message")
 
+    chat = store.chat(identifier)
+    if chat.is_group and not chat.guid:
+        raise ScopeError(
+            f"{identifier} is a group chat with no addressable id; "
+            "refusing to fall back to a single participant"
+        )
+    try:
+        floor = store.last_sent_rowid(identifier)
+    except StoreError:
+        floor = None
+
     with NamedTemporaryFile("w", suffix=".txt", encoding="utf-8", delete=False) as handle:
         handle.write(body)
         body_path = handle.name
-
     try:
-        _send_via(script, SEND_SCRIPT, body_path, target, identifier)
+        if chat.guid:
+            try:
+                transport.to_chat(chat.guid, body_path)
+            except Unaddressable as exc:
+                # The participant route reaches one person over iMessage. For a
+                # one-to-one chat that is the same person; for a group it is not.
+                if chat.is_group:
+                    raise Unaddressable(
+                        f"{identifier} is a group chat Messages will not address; "
+                        "refusing to fall back to a single participant"
+                    ) from exc
+                transport.to_participant(identifier, body_path)
+        else:
+            transport.to_participant(identifier, body_path)
     finally:
         os.unlink(body_path)
+
+    return confirm_delivery(store, identifier, floor, timeout=timeout, interval=interval)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1179,40 +1218,21 @@ def _run_send(args: argparse.Namespace) -> int:
             if args.message_file is not None
             else (args.message or "")
         )
-        # A chat with no row yet is a first message to that person, not a
-        # group: participants is 0 and the one-to-one path is correct.
-        chat = ChatStore(args.db).chat(chat_id)
-    except (ScopeError, ConfigError, StoreError) as exc:
+    except (ScopeError, ConfigError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    if chat.is_group and not chat.guid:
-        print(
-            f"error: {chat_id} is a group chat with no addressable id; "
-            "refusing to fall back to a single participant",
-            file=sys.stderr,
-        )
         return 1
 
     robot = _resolve_marker_choice(args.robot, configured)
     if robot is None:
         return 1
 
-    # Recorded before the send so the row read back afterwards is certainly
-    # the one this call produced.
-    store = ChatStore(args.db)
     try:
-        floor = store.last_sent_rowid(chat_id)
-    except StoreError:
-        floor = None  # reported as unconfirmed rather than guessed at
-
-    try:
-        send_message(chat_id, text, robot=robot, guid=chat.guid)
+        delivery = send(ChatStore(args.db), TRANSPORT, chat_id, text,
+                        robot=robot, timeout=args.confirm_timeout)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    delivery = confirm_delivery(store, chat_id, floor, timeout=args.confirm_timeout)
     marked = f"{chat_id}{' ' + AGENT_MARKER if robot else ''}"
     if delivery.status == "failed":
         print(f"error: sent to {marked} but {delivery.render()}", file=sys.stderr)
