@@ -84,13 +84,22 @@ Python 3.11+ and no runtime dependencies. macOS only — it reads Apple's
 
 ```bash
 git clone https://github.com/ericdahl-dev/imsg-agent && cd imsg-agent
-pip install -e '.[dev]'    # installs the `imsg-agent` command, plus pytest
-python3 -m pytest -q       # 38 tests, no network, no real message data
+python3 -m venv .venv                      # Homebrew/system Python refuses pip installs (PEP 668)
+.venv/bin/pip install -e '.[dev]'          # the `imsg-agent` command, plus pytest
+mkdir -p ~/.local/bin
+ln -sf "$PWD/.venv/bin/imsg-agent" ~/.local/bin/imsg-agent   # on PATH from any directory
+.venv/bin/python -m pytest -q              # no network, no real message data
 ```
 
-`pip install -e .` alone is enough if you don't want to run the tests; pytest
-is the only dev dependency. The editable install is the recommended one — it
-keeps the checkout authoritative, so `git pull` is the upgrade.
+`~/.local/bin` has to be on your `PATH`; add it in `~/.zshrc` if `imsg-agent`
+is not found afterwards. `pipx install -e .` or `uv tool install -e .` do the
+same in one step if you already use either. `.venv/` is gitignored.
+
+Every option is an editable install, which keeps the checkout authoritative, so
+`git pull` is the upgrade. Until it is installed there is no `imsg-agent`
+command; `python3 imsgread.py ...` runs the same CLI straight from the clone.
+pytest is the only dev dependency, so `.venv/bin/pip install -e .` is enough if
+you don't want to run the tests.
 
 Then configure a contact:
 
