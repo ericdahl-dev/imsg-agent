@@ -21,7 +21,6 @@ from imsgread import (
     ScopeError,
     apple_time,
     decode_attributed_body,
-    resolve_chat,
 )
 
 @pytest.fixture(autouse=True)
@@ -30,6 +29,10 @@ def no_real_chat_db(tmp_path, monkeypatch):
     conversation on the machine; a test that forgets --db must fail loudly
     rather than quietly read real messages."""
     monkeypatch.setattr(imsgread, "DEFAULT_DB", tmp_path / "no-real-chat.db")
+
+
+def book_ids(book) -> dict[str, str]:
+    return {name: c.identifier for name, c in book.items()}
 
 
 HEADER = b"\x04\x0bstreamtyped\x81\xe8\x03\x84\x01@\x84\x84\x84\x12NSAttributedString\x00\x84\x84\x08NSObject\x00\x85\x92\x84\x84\x84\x08NSString\x01\x94\x84\x01+"
@@ -111,21 +114,6 @@ def test_apple_time_of_zero_is_none():
 # --------------------------------------------------------------------------
 # scoping -- the safety property
 # --------------------------------------------------------------------------
-
-def test_resolve_chat_requires_a_target():
-    with pytest.raises(ScopeError):
-        resolve_chat(None, None)
-
-
-def test_resolve_chat_passes_through_explicit_id():
-    assert resolve_chat("+15555550123", None) == "+15555550123"
-
-
-def test_resolve_chat_rejects_unknown_contact(monkeypatch):
-    monkeypatch.setattr(imsgread, "load_contacts", lambda *a, **k: {"friend": "+1555"})
-    with pytest.raises(ScopeError, match="unknown contact"):
-        resolve_chat(None, "nobody")
-
 
 def test_read_thread_refuses_empty_chat_id():
     with pytest.raises(ScopeError):
@@ -261,7 +249,7 @@ def test_a_one_to_one_thread_keeps_its_shape_and_hides_the_number(db):
 
 def test_group_senders_use_a_known_name_and_mask_the_rest(db):
     msgs = imsgread.ChatStore(db).read_thread("chat9001",
-                       labels={"+15555550123": "alice"})
+                       name_for=imsgread.ContactBook({"alice": imsgread.Contact("+15555550123")}).label)
     senders = {m.sender for m in msgs if not m.from_me}
     assert "alice" in senders
     assert "*1111" in senders          # unnamed participant, masked
@@ -433,7 +421,7 @@ def test_contacts_env_var_wins_over_config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(imsgread, "CONFIG_CONTACTS", config)
 
     assert imsgread.contacts_path() == env_file
-    assert imsgread.load_contacts() == {"fromenv": "+1555"}
+    assert book_ids(imsgread.ContactBook.open()) == {"fromenv": "+1555"}
 
 
 def test_contacts_falls_back_to_config_dir(tmp_path, monkeypatch):
@@ -443,7 +431,7 @@ def test_contacts_falls_back_to_config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", tmp_path / "absent.toml")
 
     assert imsgread.contacts_path() == config
-    assert imsgread.load_contacts() == {"fromconfig": "+1666"}
+    assert book_ids(imsgread.ContactBook.open()) == {"fromconfig": "+1666"}
 
 
 def test_contacts_falls_back_to_file_beside_module(tmp_path, monkeypatch):
@@ -454,7 +442,7 @@ def test_contacts_falls_back_to_file_beside_module(tmp_path, monkeypatch):
     monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", bundled)
 
     assert imsgread.contacts_path() == bundled
-    assert imsgread.load_contacts() == {"frombundle": "+1777"}
+    assert book_ids(imsgread.ContactBook.open()) == {"frombundle": "+1777"}
 
 
 def test_contacts_path_points_at_config_dir_when_nothing_exists(tmp_path, monkeypatch):
@@ -466,7 +454,7 @@ def test_contacts_path_points_at_config_dir_when_nothing_exists(tmp_path, monkey
     monkeypatch.setattr(imsgread, "BUNDLED_CONTACTS", tmp_path / "absent.toml")
 
     assert imsgread.contacts_path() == config
-    assert imsgread.load_contacts() == {}
+    assert book_ids(imsgread.ContactBook.open()) == {}
 
 
 def test_contacts_file_flag_overrides_every_default(tmp_path, monkeypatch):
@@ -474,7 +462,7 @@ def test_contacts_file_flag_overrides_every_default(tmp_path, monkeypatch):
     monkeypatch.setenv(imsgread.CONTACTS_ENV, str(write_contacts(
         tmp_path / "env.toml", "other", "+1999")))
 
-    assert imsgread.resolve_chat(None, "friend", explicit) == "+1888"
+    assert imsgread.ContactBook.open(explicit).resolve(contact="friend").identifier == "+1888"
 
 
 def test_resolve_chat_honors_contacts_file_from_cli(tmp_path, messages, send_db):
@@ -528,7 +516,7 @@ def test_both_contact_forms_load_from_one_file(tmp_path):
     assert entries["colleague"] == imsgread.Contact("+1666", False)
     assert entries["family"] == imsgread.Contact("+1777", True)
     # the old contract is what every other caller still uses
-    assert imsgread.load_contacts(cfg) == {"friend": "+1555", "colleague": "+1666", "family": "+1777"}
+    assert book_ids(imsgread.ContactBook.open(cfg)) == {"friend": "+1555", "colleague": "+1666", "family": "+1777"}
 
 
 @pytest.mark.parametrize("body, fragment", [
@@ -1054,7 +1042,7 @@ class FakeTransport:
     def to_chat(self, guid, body_path):
         self.calls.append(("chat", guid, Path(body_path).read_text(encoding="utf-8")))
         if self.unaddressable:
-            raise imsgread.Unaddressable(f'Can’t get chat id "{guid}". (-1728)')
+            raise imsgread.Unaddressable("-1728", f'Can’t get chat id "{guid}". (-1728)')
         self._write("guid", guid)
 
     def to_participant(self, handle, body_path):
@@ -1150,7 +1138,7 @@ def test_an_unaddressable_group_is_refused_not_sent_to_one_person(send_db):
     """The fallback is for one-to-one chats only. Taking it for a group would
     hand the group's identifier to the single-participant script."""
     fake = FakeTransport(send_db, unaddressable=True)
-    with pytest.raises(imsgread.Unaddressable, match="group"):
+    with pytest.raises(imsgread.Unaddressable, match="^chat9001 is a group chat Messages will not address"):
         imsgread.send(imsgread.ChatStore(send_db), fake, "chat9001", "hi",
                       robot=False, timeout=0)
 
@@ -1266,7 +1254,7 @@ def test_a_contacts_env_var_pointing_nowhere_is_an_error(tmp_path, monkeypatch):
     monkeypatch.setenv("IMSG_AGENT_CONTACTS", str(tmp_path / "typo.toml"))
 
     with pytest.raises(imsgread.ConfigError, match="IMSG_AGENT_CONTACTS"):
-        imsgread.load_contacts()
+        book_ids(imsgread.ContactBook.open())
 
 
 def test_writing_a_contact_goes_where_the_env_var_points(tmp_path, monkeypatch):
@@ -1278,5 +1266,85 @@ def test_writing_a_contact_goes_where_the_env_var_points(tmp_path, monkeypatch):
 
     imsgread.write_contact("friend", imsgread.Contact("+1888", None))
 
-    assert imsgread.load_contacts() == {"friend": "+1888"}
+    assert book_ids(imsgread.ContactBook.open()) == {"friend": "+1888"}
     assert override.exists() and not config.exists()
+
+
+# --- the adapter never hands back an address ---------------------------------
+
+@pytest.mark.parametrize("route, address, stderr", [
+    ("to_participant", "+15555550123",
+     'execution error: Can’t get participant "+15555550123". (-1712)'),
+    ("to_chat", "any;-;+15555550123",
+     'execution error: Can’t get chat id "any;-;+15555550123". (-1712)'),
+])
+def test_an_adapter_error_keeps_the_code_but_not_the_address(monkeypatch, tmp_path, route, address, stderr):
+    """AppleScript names the object it could not reach. Printed as-is, that
+    put the number into the transcript of a --contact send."""
+    fake_osascript(monkeypatch, returncode=1, stderr=stderr)
+    with pytest.raises(RuntimeError) as exc:
+        getattr(imsgread.MessagesTransport(), route)(address, str(tmp_path / "b.txt"))
+
+    assert "5555550123" not in str(exc.value)
+    assert "-1712" in str(exc.value)
+
+
+def test_a_failed_send_prints_no_number(tmp_path, send_db, monkeypatch, capsys):
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\nfriend = { id = "+15555550123", marker = true }\n')
+    monkeypatch.setattr(imsgread, "TRANSPORT", imsgread.MessagesTransport())
+    fake_osascript(monkeypatch, returncode=1,
+                   stderr='execution error: Can’t get chat id "any;-;+15555550123". (-1712)')
+
+    assert main(["--send", "--contact", "friend", "--message", "hi", "--contacts-file", str(cfg),
+                 "--db", str(send_db), "--confirm-timeout", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "5555550123" not in err
+    assert "-1712" in err
+
+
+# --------------------------------------------------------------------------
+# contact book -- who a target is, and what to call them
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def book_file(tmp_path) -> Path:
+    return write_toml(tmp_path / "c.toml", (
+        '[contacts]\nfriend = "+15555550123"\n'
+        'colleague = { id = "+15555550124", marker = false }\n'
+        'crew = { id = "chat9001", marker = true }\n'
+    ))
+
+
+def test_a_contact_resolves_to_its_number_and_prints_as_its_name(book_file):
+    r = imsgread.ContactBook.open(book_file).resolve(contact="friend")
+    assert (r.identifier, r.display, r.marker) == ("+15555550123", "friend", None)
+
+
+def test_a_raw_chat_prints_masked_and_carries_no_marker(book_file):
+    """--chat is not a contact, even when the same number is configured."""
+    r = imsgread.ContactBook.open(book_file).resolve(chat="+15555550124")
+    assert (r.identifier, r.display, r.marker) == ("+15555550124", "*0124", None)
+
+
+def test_an_unknown_contact_is_refused_by_name_only(book_file):
+    with pytest.raises(ScopeError) as exc:
+        imsgread.ContactBook.open(book_file).resolve(contact="nobody")
+    assert "unknown contact 'nobody'" in str(exc.value)
+    assert "colleague, crew, friend" in str(exc.value)
+    assert "5555" not in str(exc.value)
+
+
+def test_no_target_is_refused():
+    """There is deliberately no default: no unscoped mode."""
+    with pytest.raises(ScopeError, match="--chat or --contact"):
+        imsgread.ContactBook({}).resolve()
+
+
+@pytest.mark.parametrize("handle, shown", [
+    ("+15555550123", "friend"),
+    ("+15555559999", "*9999"),
+    ("someone@example.com", "so***@example.com"),
+])
+def test_the_book_names_a_handle_or_masks_it(book_file, handle, shown):
+    assert imsgread.ContactBook.open(book_file).label(handle) == shown
