@@ -263,11 +263,21 @@ delivery = send(ChatStore(DEFAULT_DB), MessagesTransport(),
 print(delivery.render())   # "delivered over iMessage", "no delivery receipt over SMS", ...
 ```
 
+```python
+from imsgread import ContactBook
+
+book = ContactBook.open()                 # contacts.toml, found as described above
+friend = book.resolve(contact="friend")   # Recipient: identifier, name, standing marker
+print(friend.display)                     # "friend" -- never the number
+store.read_thread(friend.identifier, name_for=book.label)   # group senders by name
+```
+
 Every database failure (missing file, no Full Disk Access, corrupt file) is a
 `StoreError`, with a pointer to the Full Disk Access setting. An empty
 identifier is a `ScopeError`. `send` refuses a group it cannot address rather
 than falling back to one participant, and raises `Unaddressable` when Messages
-will not address a group at all. The transport is a seam: anything with
+will not address a group at all. Send errors carry the AppleScript code
+(`TransportError.code`, e.g. `-1712`), never the address. The transport is a seam: anything with
 `to_chat(guid, body_path)` and `to_participant(handle, body_path)` works, which
 is how the tests send without Messages.
 

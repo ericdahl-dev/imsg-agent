@@ -33,6 +33,7 @@ from dataclasses import dataclass, asdict, field
 from tempfile import NamedTemporaryFile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 __version__ = "0.1.0"
 
@@ -235,25 +236,68 @@ def load_contact_entries(path: Path | None = None) -> dict[str, Contact]:
     return {k: _parse_contact(k, v) for k, v in data.get("contacts", {}).items()}
 
 
-def load_contacts(path: Path | None = None) -> dict[str, str]:
-    """Map friendly names to chat identifiers, so callers pass `friend` rather
-    than a phone number. Keeps raw numbers out of shell history and logs."""
-    return {k: c.identifier for k, c in load_contact_entries(path).items()}
+@dataclass(frozen=True)
+class Recipient:
+    """Who a --chat or --contact target is, resolved once.
 
-
-def contact_marker(
-    contact: str | None,
-    contacts_file: Path | None = None,
-) -> bool | None:
-    """The standing marker decision for a contact, or None if there is none.
-
-    None for `--chat` too: a raw identifier is not a contact, so there is
-    nowhere for a decision to have been recorded and the caller is asked or
-    refused exactly as before.
+    `name` is the contact alias, or None for a raw --chat identifier -- which
+    is also why a raw identifier carries no standing marker decision: it is
+    not a contact, so there is nowhere one could have been recorded.
     """
-    if not contact:
-        return None
-    return load_contact_entries(contacts_file).get(contact, Contact("")).marker
+
+    identifier: str
+    name: str | None = None
+    marker: bool | None = None
+
+    @property
+    def display(self) -> str:
+        """What to print for this recipient: the alias, or a masked handle.
+        The full identifier is never the answer."""
+        return self.name or mask_handle(self.identifier)
+
+
+class ContactBook:
+    """contacts.toml, read once: who a target is, its standing marker
+    decision, and what to call a handle in output.
+
+    The one place that answers "who is this", so every output path prints a
+    name or a masked handle by asking it, rather than each re-deriving the
+    rule.
+    """
+
+    def __init__(self, entries: dict[str, Contact]):
+        self._entries = dict(entries)
+
+    @classmethod
+    def open(cls, path: Path | None = None) -> "ContactBook":
+        return cls(load_contact_entries(path))
+
+    def items(self) -> list[tuple[str, Contact]]:
+        """Every contact, sorted by name."""
+        return sorted(self._entries.items())
+
+    def label(self, handle: str) -> str:
+        """The name to print for a handle: its contact name, else masked."""
+        for name, entry in self._entries.items():
+            if entry.identifier == handle:
+                return name
+        return mask_handle(handle)
+
+    def resolve(self, chat: str | None = None, contact: str | None = None) -> Recipient:
+        """The target for --chat or --contact, or raise. No default on purpose:
+        there is no unscoped mode."""
+        if chat:
+            return Recipient(chat)
+        if not contact:
+            raise ScopeError(
+                "a chat identifier is required -- pass --chat or --contact. "
+                "This tool has no unscoped mode."
+            )
+        if contact not in self._entries:
+            known = ", ".join(sorted(self._entries)) or "none configured"
+            raise ScopeError(f"unknown contact {contact!r} (known: {known})")
+        entry = self._entries[contact]
+        return Recipient(entry.identifier, contact, entry.marker)
 
 
 CONTACTS_HEADER = """# imsg-agent contacts. Named contacts keep phone numbers out of shell history,
@@ -368,26 +412,6 @@ def write_contact(name: str, contact: Contact, path: Path | None = None) -> Path
         _verified("\n".join(lines) + "\n", name, contact, path), encoding="utf-8"
     )
     return path
-
-
-def resolve_chat(
-    chat: str | None,
-    contact: str | None,
-    contacts_file: Path | None = None,
-) -> str:
-    """Return a chat identifier, or raise. There is deliberately no default."""
-    if chat:
-        return chat
-    if contact:
-        contacts = load_contacts(contacts_file)
-        if contact not in contacts:
-            known = ", ".join(sorted(contacts)) or "none configured"
-            raise ScopeError(f"unknown contact {contact!r} (known: {known})")
-        return contacts[contact]
-    raise ScopeError(
-        "a chat identifier is required -- pass --chat or --contact. "
-        "This tool has no unscoped mode."
-    )
 
 
 # --------------------------------------------------------------------------
@@ -818,7 +842,7 @@ class ChatStore:
         chat_id: str,
         limit: int = 50,
         include_empty: bool = False,
-        labels: dict[str, str] | None = None,
+        name_for: Callable[[str], str] = mask_handle,
     ) -> list[Message]:
         """Read the most recent messages for one chat identifier, newest first.
 
@@ -826,7 +850,8 @@ class ChatStore:
         code path that reads across threads.
 
         Senders are attached only when the thread has more than one participant.
-        `labels` maps a handle to a name you already use for them, so a group
+        `name_for` turns a sender's handle into what to print -- pass a contact
+        book's `label` so a group
         transcript reads in contact names rather than phone numbers.
         """
         if not chat_id:
@@ -837,7 +862,6 @@ class ChatStore:
             is_group = _chat(conn, chat_id).is_group
             files = _attachments_for(conn, [r[0] for r in rows])
 
-        labels = labels or {}
 
         out: list[Message] = []
         for rowid, raw_date, is_from_me, text, blob, has_attachment, handle in rows:
@@ -853,7 +877,7 @@ class ChatStore:
                     has_attachment=bool(has_attachment) or bool(files.get(rowid)),
                     attachments=files.get(rowid, []),
                     sender=(
-                        labels.get(handle) or mask_handle(handle)
+                        name_for(handle)
                         if is_group and not is_from_me
                         else None
                     ),
@@ -1211,12 +1235,19 @@ def _run_config(args: argparse.Namespace) -> int:
             print(f"error: {exc}")
 
 
-def _sender_labels(contacts_file: Path | None) -> dict[str, str]:
-    """handle -> the name you already use for them, for group transcripts."""
+def _open_book(args: argparse.Namespace) -> ContactBook:
+    """The contact book for this run.
+
+    A raw --chat never needed contacts.toml, so a missing or broken file does
+    not stop it: the run just has no names to print and masks every handle.
+    --contact needs the file, and its error is raised.
+    """
     try:
-        return {c.identifier: name for name, c in load_contact_entries(contacts_file).items()}
+        return ContactBook.open(args.contacts_file)
     except ConfigError:
-        return {}
+        if args.contact:
+            raise
+        return ContactBook({})
 
 
 def _run_find_groups(args: argparse.Namespace) -> int:
@@ -1226,7 +1257,7 @@ def _run_find_groups(args: argparse.Namespace) -> int:
     no mode that enumerates the whole machine.
     """
     try:
-        handle = resolve_chat(args.chat, args.contact, args.contacts_file)
+        handle = _open_book(args).resolve(args.chat, args.contact).identifier
         groups = ChatStore(args.db).find_groups(handle)
     except (ScopeError, ConfigError, StoreError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1247,8 +1278,7 @@ def _run_send(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
-        configured = contact_marker(args.contact, args.contacts_file)
+        recipient = _open_book(args).resolve(args.chat, args.contact)
         text = (
             args.message_file.read_text(encoding="utf-8")
             if args.message_file is not None
@@ -1258,21 +1288,20 @@ def _run_send(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    robot = _resolve_marker_choice(args.robot, configured)
+    robot = _resolve_marker_choice(args.robot, recipient.marker)
     if robot is None:
         return 1
 
     try:
-        delivery = send(ChatStore(args.db), TRANSPORT, chat_id, text,
+        delivery = send(ChatStore(args.db), TRANSPORT, recipient.identifier, text,
                         robot=robot, timeout=args.confirm_timeout)
     except (ScopeError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    # The confirmation names who it went to the way the caller did, so a
-    # --contact send never puts the number into a transcript.
-    who = args.contact or mask_handle(chat_id)
-    marked = f"{who}{' ' + AGENT_MARKER if robot else ''}"
+    # The book decides what to call the recipient, so a --contact send never
+    # puts the number into a transcript.
+    marked = f"{recipient.display}{' ' + AGENT_MARKER if robot else ''}"
     if delivery.status == "failed":
         print(f"error: sent to {marked} but {delivery.render()}", file=sys.stderr)
         return 1
@@ -1288,7 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.contacts:
         try:
-            entries = load_contact_entries(args.contacts_file)
+            entries = ContactBook.open(args.contacts_file).items()
         except ConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -1300,7 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        for name, contact in sorted(entries.items()):
+        for name, contact in entries:
             # Only shown when set, so a contact with no standing decision reads
             # exactly as it did before settings existed.
             suffix = "" if contact.marker is None else f"\tmarker={marker_word(contact.marker)}"
@@ -1317,13 +1346,14 @@ def main(argv: list[str] | None = None) -> int:
         return _run_send(args)
 
     try:
-        chat_id = resolve_chat(args.chat, args.contact, args.contacts_file)
+        book = _open_book(args)
+        recipient = book.resolve(args.chat, args.contact)
         store = ChatStore(args.db)
         messages = store.read_thread(
-            chat_id,
+            recipient.identifier,
             limit=args.limit,
             include_empty=args.include_empty,
-            labels=_sender_labels(args.contacts_file),
+            name_for=book.label,
         )
     except (ScopeError, ConfigError, StoreError) as exc:
         print(f"error: {exc}", file=sys.stderr)
