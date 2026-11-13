@@ -507,7 +507,7 @@ def write_toml(path: Path, body: str) -> Path:
 def send_args(cfg: Path, db: Path, *extra: str) -> list[str]:
     # --confirm-timeout 0: the fake transport writes its row synchronously, so
     # there is nothing to wait for.
-    return ["--send", "--contact", "eric", "--message", "hi",
+    return ["--send", "--contact", "colleague", "--message", "hi",
             "--contacts-file", str(cfg), "--db", str(db), "--confirm-timeout", "0", *extra]
 
 
@@ -518,24 +518,24 @@ def was_marked(fake) -> bool:
 def test_both_contact_forms_load_from_one_file(tmp_path):
     cfg = write_toml(tmp_path / "c.toml", (
         '[contacts]\n'
-        'brian = "+1555"\n'
-        'eric = { id = "+1666", marker = false }\n'
-        'mom = { id = "+1777", marker = true }\n'
+        'friend = "+1555"\n'
+        'colleague = { id = "+1666", marker = false }\n'
+        'family = { id = "+1777", marker = true }\n'
     ))
     entries = imsgread.load_contact_entries(cfg)
 
-    assert entries["brian"] == imsgread.Contact("+1555", None)
-    assert entries["eric"] == imsgread.Contact("+1666", False)
-    assert entries["mom"] == imsgread.Contact("+1777", True)
+    assert entries["friend"] == imsgread.Contact("+1555", None)
+    assert entries["colleague"] == imsgread.Contact("+1666", False)
+    assert entries["family"] == imsgread.Contact("+1777", True)
     # the old contract is what every other caller still uses
-    assert imsgread.load_contacts(cfg) == {"brian": "+1555", "eric": "+1666", "mom": "+1777"}
+    assert imsgread.load_contacts(cfg) == {"friend": "+1555", "colleague": "+1666", "family": "+1777"}
 
 
 @pytest.mark.parametrize("body, fragment", [
-    ('[contacts]\neric = { marker = false }\n', "no 'id'"),
-    ('[contacts]\neric = { id = "+1", marekr = false }\n', "unknown key"),
-    ('[contacts]\neric = { id = "+1", marker = "never" }\n', "non-boolean"),
-    ('[contacts]\neric = 12\n', "must be an identifier or a table"),
+    ('[contacts]\ncolleague = { marker = false }\n', "no 'id'"),
+    ('[contacts]\ncolleague = { id = "+1", marekr = false }\n', "unknown key"),
+    ('[contacts]\ncolleague = { id = "+1", marker = "never" }\n', "non-boolean"),
+    ('[contacts]\ncolleague = 12\n', "must be an identifier or a table"),
 ])
 def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
     """A silently ignored marker is the worst outcome: the caller believes a
@@ -544,7 +544,7 @@ def test_a_malformed_contact_is_loud(tmp_path, body, fragment):
     with pytest.raises(imsgread.ConfigError) as exc:
         imsgread.load_contact_entries(cfg)
     assert fragment in str(exc.value)
-    assert "eric" in str(exc.value)
+    assert "colleague" in str(exc.value)
 
 
 @pytest.mark.parametrize("stored, expected", [("false", False), ("true", True)])
@@ -552,7 +552,7 @@ def test_a_contact_default_answers_for_a_program(tmp_path, messages, send_db, mo
     """The one behavior change: silence now resolves to a decision a person
     recorded, instead of being refused."""
     cfg = write_toml(tmp_path / "c.toml",
-                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+                     f'[contacts]\ncolleague = {{ id = "+1555", marker = {stored} }}\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) == 0
@@ -566,7 +566,7 @@ def test_a_contact_default_answers_for_a_program(tmp_path, messages, send_db, mo
 ])
 def test_an_explicit_flag_beats_the_contact_default(tmp_path, messages, send_db, monkeypatch, stored, flag, expected):
     cfg = write_toml(tmp_path / "c.toml",
-                     f'[contacts]\neric = {{ id = "+1555", marker = {stored} }}\n')
+                     f'[contacts]\ncolleague = {{ id = "+1555", marker = {stored} }}\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db, flag)) == 0
@@ -575,7 +575,7 @@ def test_an_explicit_flag_beats_the_contact_default(tmp_path, messages, send_db,
 
 def test_a_contact_without_a_setting_still_refuses(tmp_path, messages, send_db, monkeypatch, capsys):
     """Unchanged behavior for everyone who has not opted in."""
-    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) != 0
@@ -587,7 +587,7 @@ def test_a_raw_chat_identifier_ignores_any_contact_default(tmp_path, messages, s
     """--chat is not a contact, so there is nowhere a decision could have been
     recorded -- even when the same number is configured."""
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = false }\n')
+                     '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(["--send", "--chat", "+1555", "--message", "hi", "--confirm-timeout", "0",
@@ -600,12 +600,12 @@ def test_contacts_listing_shows_a_setting_only_when_set(tmp_path, capsys):
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml", (
-        '[contacts]\nbrian = "+1555"\neric = { id = "+1666", marker = false }\n'
+        '[contacts]\nfriend = "+1555"\ncolleague = { id = "+1666", marker = false }\n'
     ))
     assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
 
     out = capsys.readouterr().out.splitlines()
-    assert out == ["brian\t*1555", "eric\t*1666\tmarker=never"]
+    assert out == ["colleague\t*1666\tmarker=never", "friend\t*1555"]
 
 
 def test_contacts_listing_masks_identifiers_by_default(tmp_path, capsys):
@@ -613,23 +613,23 @@ def test_contacts_listing_masks_identifiers_by_default(tmp_path, capsys):
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml", (
-        '[contacts]\nbrian = "+15555550123"\nmom = "mom@example.com"\n'
+        '[contacts]\nfriend = "+15555550123"\nfamily = "family@example.com"\n'
     ))
     assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
 
     out = capsys.readouterr().out
     assert "+15555550123" not in out
-    assert "mom@example.com" not in out
-    assert out.splitlines() == ["brian\t*0123", "mom\tmo***@example.com"]
+    assert "family@example.com" not in out
+    assert out.splitlines() == ["family\tfa***@example.com", "friend\t*0123"]
 
 
 def test_contacts_listing_shows_full_identifiers_only_when_asked(tmp_path, capsys):
     from imsgread import main
 
-    cfg = write_toml(tmp_path / "c.toml", '[contacts]\nbrian = "+15555550123"\n')
+    cfg = write_toml(tmp_path / "c.toml", '[contacts]\nfriend = "+15555550123"\n')
     assert main(["--contacts", "--unmask", "--contacts-file", str(cfg)]) == 0
 
-    assert capsys.readouterr().out.splitlines() == ["brian\t+15555550123"]
+    assert capsys.readouterr().out.splitlines() == ["friend\t+15555550123"]
 
 
 # --- writing the config ------------------------------------------------------
@@ -637,32 +637,32 @@ def test_contacts_listing_shows_full_identifiers_only_when_asked(tmp_path, capsy
 def test_writing_a_contact_keeps_the_rest_of_the_file(tmp_path):
     """Rewriting from parsed data would drop a person's own comments."""
     cfg = write_toml(tmp_path / "c.toml", (
-        "# my header\n\n[contacts]\n# brian is my brother\n"
-        'brian = "+1555"\ndisco = "+1666"\n'
+        "# my header\n\n[contacts]\n# friend is my brother\n"
+        'friend = "+1555"\ndisco = "+1666"\n'
     ))
-    imsgread.write_contact("brian", imsgread.Contact("+1555", True), cfg)
-    imsgread.write_contact("eric", imsgread.Contact("+1777", False), cfg)
+    imsgread.write_contact("friend", imsgread.Contact("+1555", True), cfg)
+    imsgread.write_contact("colleague", imsgread.Contact("+1777", False), cfg)
 
     text = cfg.read_text()
     assert "# my header" in text
-    assert "# brian is my brother" in text
-    assert 'brian = { id = "+1555", marker = true }' in text
+    assert "# friend is my brother" in text
+    assert 'friend = { id = "+1555", marker = true }' in text
     assert 'disco = "+1666"' in text
-    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1777", False)
+    assert imsgread.load_contact_entries(cfg)["colleague"] == imsgread.Contact("+1777", False)
 
 
 def test_clearing_a_setting_returns_the_plain_form(tmp_path):
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = false }\n')
-    imsgread.write_contact("eric", imsgread.Contact("+1555", None), cfg)
+                     '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
+    imsgread.write_contact("colleague", imsgread.Contact("+1555", None), cfg)
 
-    assert 'eric = "+1555"' in cfg.read_text()
+    assert 'colleague = "+1555"' in cfg.read_text()
 
 
 def test_a_contact_that_would_break_the_file_is_refused(tmp_path):
     cfg = write_toml(tmp_path / "c.toml", '[contacts]\n')
     with pytest.raises(imsgread.ConfigError):
-        imsgread.write_contact("eric", imsgread.Contact('+1" , evil = "yes'), cfg)
+        imsgread.write_contact("colleague", imsgread.Contact('+1" , evil = "yes'), cfg)
     with pytest.raises(imsgread.ConfigError):
         imsgread.write_contact("not a name", imsgread.Contact("+1555"), cfg)
 
@@ -671,15 +671,15 @@ def test_a_write_that_would_corrupt_the_file_is_refused(tmp_path):
     """A [contacts.name] subtable reads fine but is invisible to a scan of the
     [contacts] table, so a naive insert would define the contact twice."""
     cfg = write_toml(tmp_path / "c.toml", (
-        '[contacts]\nbrian = "+1555"\n\n[contacts.eric]\nid = "+1666"\nmarker = false\n'
+        '[contacts]\nfriend = "+1555"\n\n[contacts.colleague]\nid = "+1666"\nmarker = false\n'
     ))
     before = cfg.read_text()
 
     with pytest.raises(imsgread.ConfigError):
-        imsgread.write_contact("eric", imsgread.Contact("+1666", True), cfg)
+        imsgread.write_contact("colleague", imsgread.Contact("+1666", True), cfg)
 
     assert cfg.read_text() == before
-    assert imsgread.load_contact_entries(cfg)["eric"] == imsgread.Contact("+1666", False)
+    assert imsgread.load_contact_entries(cfg)["colleague"] == imsgread.Contact("+1666", False)
 
 
 def test_config_mode_refuses_without_a_terminal(tmp_path, monkeypatch, capsys):
@@ -687,12 +687,12 @@ def test_config_mode_refuses_without_a_terminal(tmp_path, monkeypatch, capsys):
     code that would let it give itself a marker default."""
     from imsgread import main
 
-    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
+    cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(["--config", "--contacts-file", str(cfg)]) != 0
     assert "human at a terminal" in capsys.readouterr().err
-    assert imsgread.load_contact_entries(cfg)["eric"].marker is None
+    assert imsgread.load_contact_entries(cfg)["colleague"].marker is None
 
 
 @pytest.mark.parametrize("word, expected", [
@@ -702,13 +702,13 @@ def test_config_mode_records_a_decision(tmp_path, monkeypatch, word, expected):
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = true }\n')
-    replies = iter([f"set eric marker {word}", "quit"])
+                     '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
+    replies = iter([f"set colleague marker {word}", "quit"])
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: next(replies))
 
     assert main(["--config", "--contacts-file", str(cfg)]) == 0
-    assert imsgread.load_contact_entries(cfg)["eric"].marker is expected
+    assert imsgread.load_contact_entries(cfg)["colleague"].marker is expected
 
 
 def test_config_mode_adds_a_contact_and_keeps_its_decision(tmp_path, monkeypatch):
@@ -717,22 +717,22 @@ def test_config_mode_adds_a_contact_and_keeps_its_decision(tmp_path, monkeypatch
     from imsgread import main
 
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = false }\n')
-    replies = iter(["add mom +1777", "add eric +1888", "quit"])
+                     '[contacts]\ncolleague = { id = "+1555", marker = false }\n')
+    replies = iter(["add family +1777", "add colleague +1888", "quit"])
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: next(replies))
 
     assert main(["--config", "--contacts-file", str(cfg)]) == 0
     entries = imsgread.load_contact_entries(cfg)
-    assert entries["mom"] == imsgread.Contact("+1777", None)
-    assert entries["eric"] == imsgread.Contact("+1888", False)
+    assert entries["family"] == imsgread.Contact("+1777", None)
+    assert entries["colleague"] == imsgread.Contact("+1888", False)
 
 
 def test_config_mode_survives_a_bad_command(tmp_path, monkeypatch, capsys):
     from imsgread import main
 
-    cfg = write_contacts(tmp_path / "c.toml", "eric", "+1555")
-    replies = iter(["nonsense", "set nobody marker never", "set eric marker sometimes", "quit"])
+    cfg = write_contacts(tmp_path / "c.toml", "colleague", "+1555")
+    replies = iter(["nonsense", "set nobody marker never", "set colleague marker sometimes", "quit"])
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: next(replies))
 
@@ -790,7 +790,7 @@ def test_a_one_to_one_send_prefers_the_chat_guid(tmp_path, messages, send_db, mo
     path is pinned to the iMessage account, so addressing an SMS or RCS chat
     that way writes the message into the thread and never delivers it."""
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+15555550123", marker = true }\n')
+                     '[contacts]\ncolleague = { id = "+15555550123", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
 
     assert main(send_args(cfg, send_db)) == 0
@@ -861,7 +861,7 @@ def test_the_floor_is_the_newest_outgoing_row(delivery_db):
 def test_a_failed_delivery_makes_the_command_fail(tmp_path, send_db, monkeypatch, capsys):
     """A send that never arrived must not exit 0. That was the bug."""
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+                     '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr(imsgread, "TRANSPORT", FakeTransport(send_db, delivered=0, error=22))
 
@@ -873,7 +873,7 @@ def test_a_send_without_a_receipt_still_succeeds(tmp_path, send_db, monkeypatch,
     """Green threads routinely deliver without a receipt. The command says so
     rather than failing or claiming more than it knows."""
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+1555", marker = true }\n')
+                     '[contacts]\ncolleague = { id = "+1555", marker = true }\n')
     monkeypatch.setattr("imsgread.sys.stdin.isatty", lambda: False)
     monkeypatch.setattr(imsgread, "TRANSPORT", FakeTransport(send_db, delivered=0, service="SMS"))
 
@@ -1242,12 +1242,12 @@ def test_a_send_reports_the_contact_name_not_the_number(tmp_path, messages, send
     """--contact exists to keep numbers out of transcripts; the confirmation
     line was printing the number anyway."""
     cfg = write_toml(tmp_path / "c.toml",
-                     '[contacts]\neric = { id = "+15555550123", marker = false }\n')
+                     '[contacts]\ncolleague = { id = "+15555550123", marker = false }\n')
 
     assert main(send_args(cfg, send_db)) == 0
     err = capsys.readouterr().err
     assert "+15555550123" not in err
-    assert err.startswith("sent to eric (")
+    assert err.startswith("sent to colleague (")
 
 
 def test_a_raw_number_send_reports_it_masked(messages, send_db, capsys):

@@ -47,8 +47,8 @@ the same for a given person every time, so a contact can carry a standing one:
 
 ```toml
 [contacts]
-brian = "+15555550123"                              # asked per message
-eric  = { id = "+15555550124", marker = false }     # never marked
+friend    = "+15555550123"                              # asked per message
+colleague = { id = "+15555550124", marker = false }     # never marked
 ```
 
 An explicit flag still wins; a contact with no setting behaves exactly as
@@ -209,9 +209,9 @@ the other person's number out of the output.
 Group identifiers cannot be guessed, so ask which groups a contact is in:
 
 ```
-$ imsg-agent --find-groups --contact brian
-chat41566504093568607	8 participants	Dudes Abide
-chat606231711236685994	6 participants
+$ imsg-agent --find-groups --contact friend
+chat100000000000000001	8 participants	trail crew
+chat200000000000000002	6 participants
 ```
 
 There is no way to list every group on the machine. The answer is always scoped
