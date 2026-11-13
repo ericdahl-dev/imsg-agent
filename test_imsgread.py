@@ -707,7 +707,31 @@ def test_contacts_listing_shows_a_setting_only_when_set(tmp_path, capsys):
     assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
 
     out = capsys.readouterr().out.splitlines()
-    assert out == ["brian\t+1555", "eric\t+1666\tmarker=never"]
+    assert out == ["brian\t*1555", "eric\t*1666\tmarker=never"]
+
+
+def test_contacts_listing_masks_identifiers_by_default(tmp_path, capsys):
+    """An agent lists contacts to learn the names; the numbers must not ride along."""
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml", (
+        '[contacts]\nbrian = "+15555550123"\nmom = "mom@example.com"\n'
+    ))
+    assert main(["--contacts", "--contacts-file", str(cfg)]) == 0
+
+    out = capsys.readouterr().out
+    assert "+15555550123" not in out
+    assert "mom@example.com" not in out
+    assert out.splitlines() == ["brian\t*0123", "mom\tmo***@example.com"]
+
+
+def test_contacts_listing_shows_full_identifiers_only_when_asked(tmp_path, capsys):
+    from imsgread import main
+
+    cfg = write_toml(tmp_path / "c.toml", '[contacts]\nbrian = "+15555550123"\n')
+    assert main(["--contacts", "--unmask", "--contacts-file", str(cfg)]) == 0
+
+    assert capsys.readouterr().out.splitlines() == ["brian\t+15555550123"]
 
 
 # --- writing the config ------------------------------------------------------
@@ -1088,3 +1112,70 @@ def test_a_real_applescript_failure_still_raises(monkeypatch):
     monkeypatch.setattr("imsgread.subprocess.run", fake_run)
     with pytest.raises(RuntimeError):
         send_message("+15555550123", "hi", robot=False, guid="any;-;+15555550123")
+
+
+# --------------------------------------------------------------------------
+# staleness -- a quiet thread and a missing one look identical
+# --------------------------------------------------------------------------
+
+def test_a_thread_trailing_the_database_warns_on_stderr(db, capsys):
+    """The fixture's messages are from 2023 and the file was written just now."""
+    import json
+
+    assert imsgread.main(["--chat", "+15555550123", "--db", str(db)]) == 0
+
+    captured = capsys.readouterr()
+    assert len(json.loads(captured.out)) == 3   # stdout stays parseable
+    assert captured.err.startswith("note:")
+    assert "not proof" in captured.err
+
+
+def test_the_write_ahead_log_counts_as_the_database_being_updated(db, capsys):
+    """New rows land in chat.db-wal first; the main file can lag it for hours."""
+    import os
+
+    newest_message = 978_307_200 + 700_000_000   # the fixture thread's last row, unix time
+    os.utime(db, (newest_message + 60, newest_message + 60))
+    (db.parent / "chat.db-wal").write_bytes(b"")   # mtime: now
+
+    assert imsgread.main(["--chat", "+15555550123", "--db", str(db)]) == 0
+    assert capsys.readouterr().err.startswith("note:")
+
+
+NOW = datetime(2026, 11, 13, 0, 21, tzinfo=timezone.utc)
+
+
+def _sent_at(iso: str) -> imsgread.Message:
+    return imsgread.Message(date=iso, from_me=False, text="hi", has_attachment=False)
+
+
+def test_a_database_nobody_has_written_to_in_days_is_reported():
+    """The thread can be level with the database and both still be days old."""
+    db_updated = datetime(2026, 11, 10, 18, 15, tzinfo=timezone.utc)
+    note = imsgread.staleness_note(
+        [_sent_at("2026-11-10T18:14:00+00:00")], db_updated, now=NOW
+    )
+    assert note == (
+        "note: chat.db has not been updated since 2026-11-10 18:15 UTC; this "
+        "Mac may not be receiving messages. Treat this thread as possibly "
+        "incomplete."
+    )
+
+
+def test_an_empty_thread_is_not_reported_as_proof_of_silence():
+    note = imsgread.staleness_note([], NOW, now=NOW)
+    assert note == (
+        "note: no messages with a body found for this chat. That is not proof "
+        "there are none: rows with no text are hidden without --include-empty, "
+        "and this Mac can miss messages your phone has. Check Messages on this "
+        "Mac."
+    )
+
+
+@pytest.mark.parametrize("hours_behind, warns", [(23, False), (25, True)])
+def test_a_thread_warns_only_once_it_trails_by_more_than_a_day(hours_behind, warns):
+    from datetime import timedelta
+
+    newest = NOW - timedelta(hours=hours_behind)
+    note = imsgread.staleness_note([_sent_at(newest.isoformat())], NOW, now=NOW)
+    assert (note is not None) == warns
