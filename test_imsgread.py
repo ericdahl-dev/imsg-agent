@@ -1054,7 +1054,7 @@ class FakeTransport:
     def to_chat(self, guid, body_path):
         self.calls.append(("chat", guid, Path(body_path).read_text(encoding="utf-8")))
         if self.unaddressable:
-            raise imsgread.Unaddressable(f'Can’t get chat id "{guid}". (-1728)')
+            raise imsgread.Unaddressable("-1728", f'Can’t get chat id "{guid}". (-1728)')
         self._write("guid", guid)
 
     def to_participant(self, handle, body_path):
@@ -1150,7 +1150,7 @@ def test_an_unaddressable_group_is_refused_not_sent_to_one_person(send_db):
     """The fallback is for one-to-one chats only. Taking it for a group would
     hand the group's identifier to the single-participant script."""
     fake = FakeTransport(send_db, unaddressable=True)
-    with pytest.raises(imsgread.Unaddressable, match="group"):
+    with pytest.raises(imsgread.Unaddressable, match="^chat9001 is a group chat Messages will not address"):
         imsgread.send(imsgread.ChatStore(send_db), fake, "chat9001", "hi",
                       robot=False, timeout=0)
 
@@ -1280,3 +1280,36 @@ def test_writing_a_contact_goes_where_the_env_var_points(tmp_path, monkeypatch):
 
     assert imsgread.load_contacts() == {"friend": "+1888"}
     assert override.exists() and not config.exists()
+
+
+# --- the adapter never hands back an address ---------------------------------
+
+@pytest.mark.parametrize("route, address, stderr", [
+    ("to_participant", "+15555550123",
+     'execution error: Can’t get participant "+15555550123". (-1712)'),
+    ("to_chat", "any;-;+15555550123",
+     'execution error: Can’t get chat id "any;-;+15555550123". (-1712)'),
+])
+def test_an_adapter_error_keeps_the_code_but_not_the_address(monkeypatch, tmp_path, route, address, stderr):
+    """AppleScript names the object it could not reach. Printed as-is, that
+    put the number into the transcript of a --contact send."""
+    fake_osascript(monkeypatch, returncode=1, stderr=stderr)
+    with pytest.raises(RuntimeError) as exc:
+        getattr(imsgread.MessagesTransport(), route)(address, str(tmp_path / "b.txt"))
+
+    assert "5555550123" not in str(exc.value)
+    assert "-1712" in str(exc.value)
+
+
+def test_a_failed_send_prints_no_number(tmp_path, send_db, monkeypatch, capsys):
+    cfg = write_toml(tmp_path / "c.toml",
+                     '[contacts]\nfriend = { id = "+15555550123", marker = true }\n')
+    monkeypatch.setattr(imsgread, "TRANSPORT", imsgread.MessagesTransport())
+    fake_osascript(monkeypatch, returncode=1,
+                   stderr='execution error: Can’t get chat id "any;-;+15555550123". (-1712)')
+
+    assert main(["--send", "--contact", "friend", "--message", "hi", "--contacts-file", str(cfg),
+                 "--db", str(send_db), "--confirm-timeout", "0"]) == 1
+    err = capsys.readouterr().err
+    assert "5555550123" not in err
+    assert "-1712" in err

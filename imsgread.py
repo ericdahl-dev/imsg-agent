@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -915,16 +916,40 @@ end run"""
 UNADDRESSABLE_CHAT = "-1728"
 
 
+class TransportError(RuntimeError):
+    """Messages refused a send. Carries the AppleScript error code, never the
+    address: AppleScript names the object it could not reach, and that name
+    is the phone number or a guid built from it.
+
+    `detail` keeps the raw text for someone debugging at a terminal; it is not
+    part of the message, so printing the error cannot leak it.
+    """
+
+    def __init__(self, code: str | None, detail: str = "", message: str | None = None):
+        self.code = code
+        self.detail = detail
+        where = f" (AppleScript error {code})" if code else ""
+        super().__init__(message or f"Messages refused the send{where}")
+
+
+class Unaddressable(TransportError):
+    """Messages will not address this chat (AppleScript error -1728)."""
+
+
+_APPLESCRIPT_CODE = re.compile(r"\((-\d+)\)\s*$")
+
+
 def _osascript(script: str, *args: str) -> None:
     result = subprocess.run(
         ["osascript", "-e", script, *args], capture_output=True, text=True
     )
     if result.returncode != 0:
-        raise RuntimeError(f"osascript failed: {result.stderr.strip()}")
-
-
-class Unaddressable(RuntimeError):
-    """Messages will not address this chat (AppleScript error -1728)."""
+        detail = result.stderr.strip()
+        match = _APPLESCRIPT_CODE.search(detail)
+        code = match.group(1) if match else None
+        if code == UNADDRESSABLE_CHAT:
+            raise Unaddressable(code, detail)
+        raise TransportError(code, detail)
 
 
 class MessagesTransport:
@@ -932,16 +957,12 @@ class MessagesTransport:
     real. Tests use a fake that writes the row Messages would write.
 
     Raises Unaddressable for -1728 so `send` can decide whether a fallback is
-    safe; every other AppleScript failure is a plain RuntimeError.
+    safe; every other AppleScript failure is a TransportError. Neither ever
+    carries the address in its message.
     """
 
     def to_chat(self, guid: str, body_path: str) -> None:
-        try:
-            _osascript(CHAT_SEND_SCRIPT, body_path, guid)
-        except RuntimeError as exc:
-            if UNADDRESSABLE_CHAT in str(exc):
-                raise Unaddressable(str(exc)) from exc
-            raise
+        _osascript(CHAT_SEND_SCRIPT, body_path, guid)
 
     def to_participant(self, handle: str, body_path: str) -> None:
         _osascript(SEND_SCRIPT, body_path, handle)
@@ -1011,8 +1032,9 @@ def send(
                 # one-to-one chat that is the same person; for a group it is not.
                 if chat.is_group:
                     raise Unaddressable(
+                        exc.code, exc.detail,
                         f"{identifier} is a group chat Messages will not address; "
-                        "refusing to fall back to a single participant"
+                        "refusing to fall back to a single participant",
                     ) from exc
                 transport.to_participant(identifier, body_path)
         else:
